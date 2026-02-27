@@ -40,8 +40,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Import core modules
 from state.state_builder import build_state
 from engine.evaluator import evaluate, EvaluatorConfig, Decision
-from mt5.live_feed import MT5LiveFeed
-from mt5.orders import MT5Orders, OrderAction
 
 # ============================================================================
 # CONFIGURATION & CONSTANTS
@@ -99,7 +97,7 @@ def setup_logging(config: Config) -> logging.Logger:
         timestamp = datetime.now().strftime('%Y%m%d')
         log_file = log_dir / f'trading_engine_{timestamp}.log'
         
-        file_handler = logging.FileHandler(log_file)
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(getattr(logging, config.LOG_LEVEL))
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
@@ -160,13 +158,19 @@ class RealtimeEngine:
         self.running = False
         self.iterations = 0
         self.errors = 0
+        self.data_errors = 0
+        # Per-symbol last timestamp to enforce monotonicity
+        self._last_ts_by_symbol = {}
         
         logger.info(f"Initializing RealtimeEngine - DEMO_MODE={self.demo_mode}")
         logger.info(f"Symbol: {config.SYMBOL}, Interval: {config.LOOP_INTERVAL}s")
         
         # Initialize core modules
-        self.feed = MT5LiveFeed()
-        self.orders = MT5Orders() if not demo_mode else None
+        # Realtime should not import provider SDKs directly. The unified feed
+        # (data.unified_feed) is the canonical ingestion layer and adapters
+        # handle provider connections. Keep feed/orders None here.
+        self.feed = None
+        self.orders = None
         
         # Position tracking
         self.position = PositionState()
@@ -187,22 +191,9 @@ class RealtimeEngine:
         Returns:
             True if connection successful, False if falling back to demo mode
         """
-        logger.info("Attempting to connect to MetaTrader5...")
-        
-        try:
-            if self.feed.connect():
-                logger.info("✓ Connected to MetaTrader5 successfully")
-                return True
-            else:
-                logger.warning("✗ Failed to connect to MetaTrader5")
-                logger.info("Switching to DEMO mode (mock data)")
-                self.demo_mode = True
-                return False
-        except Exception as e:
-            logger.error(f"Connection error: {e}")
-            logger.info("Switching to DEMO mode (mock data)")
-            self.demo_mode = True
-            return False
+        logger.info("Skipping direct provider connection in RealtimeEngine; unified_feed manages provider connectivity.")
+        # Assume unified_feed will supply snapshots; treat engine as ready.
+        return True
     
     def _fetch_market_data(self) -> Optional[Dict[str, Any]]:
         """
@@ -211,21 +202,14 @@ class RealtimeEngine:
         Returns:
             Dictionary with tick data, or None if fetch fails
         """
+        from data.unified_feed import get_snapshot
+
         try:
-            tick = self.feed.get_tick(self.config.SYMBOL)
-            if tick is None:
-                logger.warning(f"Failed to fetch tick data for {self.config.SYMBOL}")
-                return None
-            
-            return {
-                'symbol': self.config.SYMBOL,
-                'bid': tick.bid,
-                'ask': tick.ask,
-                'spread_pips': (tick.ask - tick.bid) * 10000,  # Assuming 4 decimals
-                'timestamp': tick.timestamp,
-            }
+            snapshot = get_snapshot(self.config.SYMBOL)
+            return snapshot
         except Exception as e:
-            logger.error(f"Error fetching market data: {e}")
+            logger.error(f"Failed to fetch snapshot for {self.config.SYMBOL}: {e}")
+            self.errors += 1
             return None
     
     def _build_state(self, market_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -239,16 +223,25 @@ class RealtimeEngine:
             Complete state dictionary, or None if build fails
         """
         try:
-            state = build_state(self.config.SYMBOL, use_demo=self.demo_mode)
-            
+            # Prefer live MT5 data when the feed is connected even if the
+            # engine runs in DEMO mode (DEMO only controls execution, not
+            # data source). If the feed is disconnected, fall back to demo.
+            try:
+                feed_connected = self.feed.is_connected()
+            except Exception:
+                feed_connected = False
+
+            use_demo_flag = not feed_connected
+
+            # Build the canonical state using state_builder from a canonical snapshot
+            state = build_state(self.config.SYMBOL, snapshot=market_data, use_demo=use_demo_flag)
             if state is None:
-                logger.warning("Failed to build market state")
+                logger.debug("No state built from snapshot; skipping")
                 return None
-            
-            # Add real-time market data to state
+
+            # Attach the canonical snapshot as market_data for downstream execution
             state['market_data'] = market_data
-            state['timestamp'] = time.time()
-            
+
             return state
         except Exception as e:
             logger.error(f"Error building market state: {e}")
@@ -460,14 +453,25 @@ class RealtimeEngine:
     
     def _log_iteration_summary(self, market_data: Dict[str, Any], decision: Decision):
         """Log summary of current iteration"""
-        logger.debug(
+        bid = market_data.get('bid')
+        ask = market_data.get('ask')
+        spread_pips = None
+        try:
+            if bid is not None and ask is not None:
+                spread_pips = (float(ask) - float(bid)) * 10000.0
+        except Exception:
+            spread_pips = None
+
+        spread_str = f"Spread={spread_pips:.1f}pips" if spread_pips is not None else "Spread=N/A"
+        msg = (
             f"Iteration {self.iterations}: "
-            f"Bid={market_data['bid']:.5f}, "
-            f"Ask={market_data['ask']:.5f}, "
-            f"Spread={market_data['spread_pips']:.1f}pips, "
+            f"Bid={bid if bid is not None else 'N/A'}, "
+            f"Ask={ask if ask is not None else 'N/A'}, "
+            f"{spread_str}, "
             f"Decision={decision}, "
             f"Position={'OPEN' if self.position.is_open() else 'CLOSED'}"
         )
+        logger.debug(msg)
     
     def run_iteration(self) -> bool:
         """
@@ -480,14 +484,28 @@ class RealtimeEngine:
         iteration_start = time.time()
         
         try:
-            # Step 1: Fetch market data
-            market_data = self._fetch_market_data()
-            if market_data is None:
-                logger.warning("Skipping iteration - failed to fetch market data")
-                return False
-            
-            # Step 2: Build market state
-            state = self._build_state(market_data)
+            # Step 1: Fetch a canonical snapshot from the unified feed
+            snapshot = self._fetch_market_data()
+            if snapshot is None:
+                # No new data this iteration (duplicate/stale or no provider update)
+                logger.debug("No new snapshot this iteration; benign no-op")
+                return True
+
+            # Validate canonical snapshot before state build
+            try:
+                from data.canonical_schema import validate_snapshot, assert_snapshot
+                if not validate_snapshot(snapshot):
+                    logger.warning("Received snapshot failed canonical validation; dropping this iteration")
+                    self.data_errors += 1
+                    return False
+                DEBUG = False
+                if DEBUG:
+                    assert_snapshot(snapshot)
+            except Exception:
+                logger.debug("Canonical schema unavailable; proceeding with snapshot conservatively")
+
+            # Step 2: Build market state from canonical snapshot
+            state = self._build_state(snapshot)
             if state is None:
                 logger.warning("Skipping iteration - failed to build state")
                 return False
@@ -579,8 +597,9 @@ class RealtimeEngine:
         
         # Disconnect from MT5
         try:
-            self.feed.disconnect()
-            logger.info("Disconnected from MetaTrader5")
+            if self.feed and hasattr(self.feed, 'disconnect'):
+                self.feed.disconnect()
+                logger.info("Disconnected from provider feed")
         except Exception as e:
             logger.error(f"Error disconnecting: {e}")
         

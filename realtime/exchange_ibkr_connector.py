@@ -85,6 +85,8 @@ class IBKRConnector(BaseConnector):
         # Order tracking
         self.order_counter = 0
         self.ibkr_order_map = {}  # ibkr_order_id -> our order_id
+        # Per-symbol last timestamp tracker (float seconds)
+        self._last_tick_ts: Dict[str, float] = {}
 
         logger.info(
             f"Initialized IBKR connector ({host}:{port}, client_id={client_id})"
@@ -272,29 +274,44 @@ class IBKRConnector(BaseConnector):
             if not all([symbol, bid is not None, ask is not None]):
                 return None
 
-            tick = PriceTick(
-                symbol=symbol,
-                bid=bid,
-                ask=ask,
-                last=last or (bid + ask) / 2,
-                bid_volume=exchange_data.get("bid_volume", 0),
-                ask_volume=exchange_data.get("ask_volume", 0),
-                last_volume=exchange_data.get("last_volume", 0),
-                timestamp=datetime.now(timezone.utc),
-                exchange="IBKR",
-            )
+            # Parse timestamp from exchange_data (do not fabricate)
+            raw_ts = exchange_data.get("timestamp") or exchange_data.get("time") or exchange_data.get("date")
+            ts_dt = self._parse_timestamp(raw_ts)
+            if ts_dt is None:
+                logger.warning(f"IBKR: Missing/invalid timestamp for tick {symbol}; dropping")
+                self.stats["data_errors"] += 1
+                return None
+
+            ts = self._dt_to_seconds(ts_dt)
+            last_ts = self._last_tick_ts.get(symbol)
+            if last_ts is not None and ts <= last_ts:
+                logger.warning(f"IBKR: Tick timestamp not monotonic for {symbol}: {ts} <= {last_ts}; dropping")
+                self.stats["data_errors"] += 1
+                return None
+            self._last_tick_ts[symbol] = ts
+
+            canonical = {
+                "symbol": symbol,
+                "timestamp": float(ts),
+                "bid": float(bid),
+                "ask": float(ask),
+                "last": float(last if last is not None else (float(bid) + float(ask)) / 2.0),
+                "volume": float(exchange_data.get("volume", 0) or 0.0),
+                "source": "ibkr",
+            }
 
             update = MarketUpdate(
                 data_type=DataType.PRICE_TICK,
-                payload=tick,
-                timestamp=datetime.now(timezone.utc),
-                sequence_number=self.stats["updates_received"],
+                payload=canonical,
+                timestamp=ts_dt,
+                sequence_number=self.stats.get("updates_received", 0),
+                source="ibkr",
             )
 
-            self.last_heartbeat = datetime.now(timezone.utc)
+            self.last_heartbeat = ts_dt
             self.stats["updates_received"] += 1
-            self._record_market_data_timestamp(update.timestamp)
-            self._record_heartbeat(update.timestamp)
+            self._record_market_data_timestamp(ts_dt)
+            self._record_heartbeat(ts_dt)
 
             return update
 
@@ -325,11 +342,23 @@ class IBKRConnector(BaseConnector):
                 exchange="IBKR",
             )
 
+            # Convert snapshot to dict payload and normalize timestamp
+            payload = snapshot.to_dict()
+            # Parse timestamp if provided in exchange_data
+            raw_ts = exchange_data.get("timestamp") or exchange_data.get("time")
+            ts_dt = self._parse_timestamp(raw_ts) or snapshot.timestamp
+            ts = self._dt_to_seconds(ts_dt)
+            try:
+                payload["timestamp"] = float(ts)
+            except Exception:
+                payload["timestamp"] = ts
+
             update = MarketUpdate(
                 data_type=DataType.ORDERBOOK_SNAPSHOT,
-                payload=snapshot,
-                timestamp=datetime.now(timezone.utc),
-                sequence_number=self.stats["updates_received"],
+                payload=payload,
+                timestamp=ts_dt,
+                sequence_number=self.stats.get("updates_received", 0),
+                source="ibkr",
             )
 
             self.stats["updates_received"] += 1
@@ -501,3 +530,28 @@ class IBKRConnector(BaseConnector):
             order.status = OrderStatus.PARTIALLY_FILLED
 
         logger.info(f"IBKR: Fill {order_id}: {filled_qty} @ {fill_price}")
+
+    def _parse_timestamp(self, raw_ts) -> Optional[datetime]:
+        try:
+            if raw_ts is None:
+                return None
+            if isinstance(raw_ts, datetime):
+                return raw_ts
+            if isinstance(raw_ts, str):
+                try:
+                    return datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+                except Exception:
+                    return None
+            if isinstance(raw_ts, (int, float)):
+                if raw_ts > 1e12:
+                    return datetime.fromtimestamp(float(raw_ts) / 1000.0, timezone.utc)
+                else:
+                    return datetime.fromtimestamp(float(raw_ts), timezone.utc)
+        except Exception:
+            return None
+
+    def _dt_to_seconds(self, dt: datetime) -> float:
+        try:
+            return float(dt.timestamp())
+        except Exception:
+            return float(time.time())

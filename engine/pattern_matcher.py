@@ -1,15 +1,12 @@
+
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
 from .decision_frame import DecisionFrame
-from .pattern_templates import (
-    PATTERN_TEMPLATES,
-    PatternFamily,
-    PatternTemplate,
-    load_default_templates,
-)
+from .pattern_templates import (PATTERN_TEMPLATES, PatternFamily,
+                                PatternTemplate, load_default_templates)
 
 
 @dataclass(frozen=True)

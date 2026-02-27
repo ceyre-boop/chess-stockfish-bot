@@ -42,7 +42,9 @@ class DecisionLogger:
         additional_props_allowed = True
         if self._schema and isinstance(self._schema.get("properties"), dict):
             allowed_props = set(self._schema["properties"].keys())
-            additional_props_allowed = self._schema.get("additionalProperties", True) is not False
+            additional_props_allowed = (
+                self._schema.get("additionalProperties", True) is not False
+            )
         cv = normalized.get("condition_vector")
         if cv is not None and is_dataclass(cv):
             normalized["condition_vector"] = asdict(cv)
@@ -70,24 +72,29 @@ class DecisionLogger:
             "template_family",
             "template_policy_label",
         ]:
-            if key not in normalized and (additional_props_allowed or (allowed_props and key in allowed_props)):
+            if key not in normalized and (
+                additional_props_allowed or (allowed_props and key in allowed_props)
+            ):
                 normalized[key] = None
 
         # Bubble up template metadata from chosen_action if present
         chosen = normalized.get("chosen_action")
         if isinstance(chosen, dict):
             if normalized.get("template_id") is None and (
-                additional_props_allowed or (allowed_props and "template_id" in allowed_props)
+                additional_props_allowed
+                or (allowed_props and "template_id" in allowed_props)
             ):
                 normalized["template_id"] = chosen.get("template_id") or chosen.get(
                     "entry_model_id"
                 )
             if normalized.get("eco_code") is None and (
-                additional_props_allowed or (allowed_props and "eco_code" in allowed_props)
+                additional_props_allowed
+                or (allowed_props and "eco_code" in allowed_props)
             ):
                 normalized["eco_code"] = chosen.get("eco_code")
             if normalized.get("template_family") is None and (
-                additional_props_allowed or (allowed_props and "template_family" in allowed_props)
+                additional_props_allowed
+                or (allowed_props and "template_family" in allowed_props)
             ):
                 normalized["template_family"] = chosen.get("template_family")
             if normalized.get("template_policy_label") is None and (

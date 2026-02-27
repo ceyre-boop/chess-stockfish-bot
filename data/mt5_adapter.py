@@ -11,8 +11,6 @@ import math
 import time
 from typing import Dict, Generator, Optional
 
-import MetaTrader5 as mt5
-
 from config.env_loader import load_env
 
 logger = logging.getLogger(__name__)
@@ -36,6 +34,11 @@ def initialize_mt5(
     if login is None or password is None or server is None:
         raise MT5AdapterError("MT5 credentials not set in environment or .env")
 
+    try:
+        import MetaTrader5 as mt5
+    except Exception as exc:
+        raise MT5AdapterError(f"MetaTrader5 import failed: {exc}")
+
     if not mt5.initialize(server=server):
         raise MT5AdapterError(f"MT5 initialize failed: {mt5.last_error()}")
     if not mt5.login(int(login), password=password, server=server):
@@ -43,26 +46,51 @@ def initialize_mt5(
 
 
 def shutdown_mt5() -> None:
-    mt5.shutdown()
+    try:
+        import MetaTrader5 as mt5
+        mt5.shutdown()
+    except Exception:
+        return
 
 
 def _canonical_tick(tick, symbol: str) -> Dict:
-    mid = (tick.bid + tick.ask) / 2.0
+    # Prefer time_msc for ms precision; fallback to time
+    t_msc = getattr(tick, "time_msc", None)
+    if t_msc is not None:
+        try:
+            ts = float(int(t_msc)) / 1000.0
+        except Exception:
+            ts = None
+    else:
+        ts = None
+    if ts is None:
+        try:
+            ts = float(getattr(tick, "time", 0.0))
+        except Exception:
+            ts = 0.0
+
+    bid = float(getattr(tick, "bid", 0.0))
+    ask = float(getattr(tick, "ask", 0.0))
+    last = float(getattr(tick, "last", bid))
+    vol = float(getattr(tick, "volume", 0.0))
+
     return {
-        "timestamp": float(tick.time),
-        "bid": float(tick.bid),
-        "ask": float(tick.ask),
-        "mid": mid,
-        "price": mid,
-        "volume": float(getattr(tick, "volume", 0.0)),
-        "buy_volume": float(getattr(tick, "volume", 0.0)) / 2.0,
-        "sell_volume": float(getattr(tick, "volume", 0.0)) / 2.0,
         "symbol": symbol,
-        "raw": tick._asdict(),
+        "timestamp": float(ts),
+        "bid": bid,
+        "ask": ask,
+        "last": last,
+        "volume": vol,
+        "source": "mt5",
     }
 
 
 def stream_live(symbol: str, poll_interval: float = 0.5) -> Generator[Dict, None, None]:
+    try:
+        import MetaTrader5 as mt5
+    except Exception as exc:
+        raise MT5AdapterError(f"MetaTrader5 import failed: {exc}")
+
     if not mt5.symbol_select(symbol, True):
         raise MT5AdapterError(f"Unable to select symbol {symbol}: {mt5.last_error()}")
     if not mt5.initialized() and not mt5.initialize():
@@ -83,16 +111,7 @@ def stream_live(symbol: str, poll_interval: float = 0.5) -> Generator[Dict, None
 
 
 def _validate_tick(tick: Dict, last_ts: Optional[float]) -> bool:
-    required = [
-        "timestamp",
-        "bid",
-        "ask",
-        "mid",
-        "volume",
-        "buy_volume",
-        "sell_volume",
-        "raw",
-    ]
+    required = ["timestamp", "bid", "ask", "last", "volume"]
     for field in required:
         if field not in tick or tick[field] is None:
             logger.error(f"MT5 tick missing required field {field}; skipping")

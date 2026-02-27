@@ -106,6 +106,8 @@ class FIXConnector(BaseConnector):
         # Order tracking
         self.order_counter = 0
         self.fix_order_map = {}  # ClOrdID -> our order_id
+        # Per-symbol last timestamp tracker (float seconds)
+        self._last_tick_ts: Dict[str, float] = {}
 
         # Threads
         self.reader_thread = None
@@ -394,25 +396,44 @@ class FIXConnector(BaseConnector):
             if bid == 0 or ask == 0:
                 return
 
-            tick = PriceTick(
-                symbol=symbol,
-                bid=bid,
-                ask=ask,
-                last=(bid + ask) / 2,
-                timestamp=datetime.now(timezone.utc),
-                exchange="FIX",
-            )
+            # Parse timestamp from incoming FIX fields (do not fabricate)
+            raw_ts = fields.get("273") or fields.get("52") or fields.get("60")
+            ts_dt = self._parse_timestamp(raw_ts)
+            if ts_dt is None:
+                logger.warning(f"FIX: Missing/invalid timestamp for tick {symbol}; dropping")
+                self.stats["data_errors"] += 1
+                return
+
+            ts = self._dt_to_seconds(ts_dt)
+            last_ts = self._last_tick_ts.get(symbol)
+            if last_ts is not None and ts <= last_ts:
+                logger.warning(
+                    f"FIX: Tick timestamp not monotonic for {symbol}: {ts} <= {last_ts}; dropping"
+                )
+                self.stats["data_errors"] += 1
+                return
+            self._last_tick_ts[symbol] = ts
+
+            canonical = {
+                "symbol": symbol,
+                "timestamp": float(ts),
+                "bid": float(bid),
+                "ask": float(ask),
+                "last": float((bid + ask) / 2.0),
+                "volume": float(fields.get("271", 0) or 0.0),
+                "source": "fix",
+            }
 
             update = MarketUpdate(
                 data_type=DataType.PRICE_TICK,
-                payload=tick,
-                timestamp=datetime.now(timezone.utc),
-                sequence_number=self.stats["updates_received"],
+                payload=canonical,
+                timestamp=ts_dt,
+                sequence_number=self.stats.get("updates_received", 0),
             )
 
             self.push_update(update)
-            self._record_market_data_timestamp(update.timestamp)
-            self.stats["updates_received"] += 1
+            self._record_market_data_timestamp(ts_dt)
+            self.stats["updates_received"] = self.stats.get("updates_received", 0) + 1
 
         except Exception as e:
             logger.error(f"FIX: Snapshot error: {str(e)}")
@@ -594,3 +615,63 @@ class FIXConnector(BaseConnector):
         except Exception as e:
             logger.error(f"FIX: Execution report error: {str(e)}")
             self.stats["order_errors"] += 1
+
+    def _parse_timestamp(self, raw_ts) -> Optional[datetime]:
+        """Parse various timestamp formats to a UTC datetime or return None.
+
+        Accepts numeric seconds, numeric milliseconds, ISO strings with Z or offset,
+        and common FIX timestamp format YYYYMMDD-HH:MM:SS[.fff]. Do NOT fabricate.
+        """
+        if raw_ts is None:
+            return None
+
+        try:
+            # Numeric types
+            if isinstance(raw_ts, (int, float)):
+                t = float(raw_ts)
+                if t > 1e12:  # milliseconds
+                    return datetime.fromtimestamp(t / 1000.0, timezone.utc)
+                return datetime.fromtimestamp(t, timezone.utc)
+
+            s = str(raw_ts).strip()
+            # Pure digit string -> seconds or ms
+            if s.isdigit():
+                t = float(s)
+                if len(s) >= 13:
+                    return datetime.fromtimestamp(t / 1000.0, timezone.utc)
+                return datetime.fromtimestamp(t, timezone.utc)
+
+            # ISO8601 with trailing Z -> convert to +00:00 for fromisoformat
+            if s.endswith("Z"):
+                s2 = s.replace("Z", "+00:00")
+            else:
+                s2 = s
+
+            try:
+                dt = datetime.fromisoformat(s2)
+            except Exception:
+                # Try FIX basic timestamp formats
+                dt = None
+                for fmt in ("%Y%m%d-%H:%M:%S.%f", "%Y%m%d-%H:%M:%S"):
+                    try:
+                        dt = datetime.strptime(s, fmt)
+                        dt = dt.replace(tzinfo=timezone.utc)
+                        break
+                    except Exception:
+                        dt = None
+                if dt is None:
+                    return None
+
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+
+            return dt
+
+        except Exception:
+            return None
+
+    def _dt_to_seconds(self, dt: datetime) -> float:
+        """Convert a UTC datetime to float seconds since epoch."""
+        return float(dt.timestamp())

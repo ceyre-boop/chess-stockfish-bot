@@ -11,6 +11,7 @@ from .mcr_engine import evaluate_action_via_mcr
 from .mcr_scenarios import MCRActionContext
 from .opening_book import OpeningBookV1, build_action_id
 from .pattern_templates import PATTERN_TEMPLATES, PatternFamily
+from .search.search_engine_regime_adapter import RegimeScoringWeights
 from .template_performance import TemplatePolicyLabel
 from .transposition_table import TranspositionTable
 
@@ -186,9 +187,21 @@ def score_actions_via_search(
     n_paths: int,
     horizon_bars: int,
     seed: int,
+    regime_weights: RegimeScoringWeights | None = None,
     template_policy: Dict[str, TemplatePolicyLabel] | None = None,
 ) -> List[Tuple[DecisionAction, Dict[str, Any]]]:
     results: List[Tuple[DecisionAction, Dict[str, Any]]] = []
+
+    weights = regime_weights or RegimeScoringWeights(
+        lambda_ev=1.0,
+        lambda_mcr=0.5,
+        lambda_variance=0.2,
+        lambda_tail_risk=0.3,
+        lambda_policy_boost=1.0,
+        rollout_horizon=horizon_bars,
+        mc_paths=n_paths,
+        opening_book_weight=1.0,
+    )
 
     for idx, action in enumerate(candidate_actions):
         mcr_ctx = MCRActionContext(
@@ -204,8 +217,8 @@ def score_actions_via_search(
         mcr_metrics = evaluate_action_via_mcr(
             frame,
             mcr_ctx,
-            n_paths=n_paths,
-            horizon_bars=horizon_bars,
+            n_paths=weights.mc_paths,
+            horizon_bars=weights.rollout_horizon,
             seed=seed + idx,
         )
 
@@ -227,13 +240,13 @@ def score_actions_via_search(
         )
 
         unified = (
-            ev_hat_adj
-            + 0.5 * mcr_metrics.get("mean_EV", 0.0)
-            - 0.2 * mcr_metrics.get("variance_EV", 0.0)
-            - 0.3 * mcr_metrics.get("tail_risk", 0.0)
+            weights.lambda_ev * ev_hat_adj
+            + weights.lambda_mcr * mcr_metrics.get("mean_EV", 0.0)
+            - weights.lambda_variance * mcr_metrics.get("variance_EV", 0.0)
+            - weights.lambda_tail_risk * mcr_metrics.get("tail_risk", 0.0)
             + 0.1 * mcr_metrics.get("tp_hit_rate", 0.0)
             - 0.1 * mcr_metrics.get("stop_hit_rate", 0.0)
-            + multiplier
+            + weights.lambda_policy_boost * multiplier
         )
 
         score = {
@@ -262,6 +275,7 @@ def score_actions_with_cache(
     horizon_bars: int,
     seed: int,
     table: TranspositionTable,
+    regime_weights: RegimeScoringWeights | None = None,
     template_policy: Dict[str, TemplatePolicyLabel] | None = None,
 ) -> List[Tuple[DecisionAction, Dict[str, Any]]]:
     results: List[Tuple[DecisionAction, Dict[str, Any]]] = []
@@ -293,6 +307,7 @@ def score_actions_with_cache(
             n_paths=n_paths,
             horizon_bars=horizon_bars,
             seed=seed,
+            regime_weights=regime_weights,
             template_policy=template_policy,
         )[0][1]
         table.store(key, scores)
@@ -306,6 +321,8 @@ def apply_opening_book_scores(
     position_state: Any,
     candidate_actions: List[DecisionAction],
     score_dicts: List[Dict[str, Any]],
+    *,
+    weight: float = 1.0,
 ) -> None:
     """
     Apply opening book adjustments to unified scores in-place.
@@ -314,7 +331,7 @@ def apply_opening_book_scores(
     opening_scores = opening_book.lookup(frame, position_state, candidate_actions)
     for action, score_dict in zip(candidate_actions, score_dicts):
         aid = build_action_id(action)
-        boost = float(opening_scores.get(aid, 0.0))
+        boost = float(opening_scores.get(aid, 0.0)) * weight
         score_dict["opening_book_score"] = boost
         score_dict["unified_score"] = float(
             score_dict.get("unified_score", 0.0) + boost

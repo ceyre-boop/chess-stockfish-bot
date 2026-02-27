@@ -44,6 +44,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Adapter-level last tick timestamp for mock ticks (seconds float)
+_last_tick_ts: float = 0.0
+
 
 # MT5 Error Codes (from documentation)
 MT5_ERRORS = {
@@ -126,33 +129,71 @@ class MockTickData:
     last: float = 1.0851
     time: int = field(default_factory=lambda: int(time.time()))
     time_msc: int = field(default_factory=lambda: int(time.time() * 1000))
+    timestamp: float = field(default=0.0)
+    
+    def __post_init__(self):
+        """Normalize time fields and provide canonical `timestamp` alias.
+
+        Also enforce monotonic increasing timestamps for mock ticks so
+        downstream consumers never see non-monotonic times from mocks.
+        """
+        global _last_tick_ts
+        try:
+            ts = float(getattr(self, "time_msc", 0)) / 1000.0
+            if not ts or ts <= 0:
+                ts = float(getattr(self, "time", time.time()))
+        except Exception:
+            ts = time.time()
+
+        if ts <= _last_tick_ts:
+            ts = _last_tick_ts + 0.001
+        _last_tick_ts = ts
+
+        # Normalize stored fields
+        try:
+            self.time = int(ts)
+            self.time_msc = int(ts * 1000)
+            # Provide attribute alias expected by callers
+            setattr(self, "timestamp", ts)
+        except Exception:
+            pass
     
     def to_dict(self) -> Dict:
         """Convert to MT5 request dict format"""
-        if self.action == "buy":
-            order_type = mt5.ORDER_TYPE_BUY if MT5_AVAILABLE else 0
-        elif self.action == "sell":
-            order_type = mt5.ORDER_TYPE_SELL if MT5_AVAILABLE else 1
-        else:
-            order_type = mt5.ORDER_TYPE_BUY
-        
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL if MT5_AVAILABLE else 0,
-            "symbol": self.symbol,
-            "volume": self.volume,
-            "type": order_type,
-            "price": self.price,
-            "comment": self.comment,
-            "magic": self.magic,
+        # This dataclass is used as a mock for ticks in some test paths.
+        # `to_dict()` historically attempted to produce an order request
+        # but mock tick objects do not carry order fields. Keep this
+        # method conservative and return an empty dict to avoid attribute
+        # errors if called in tests. Use `to_canonical()` below for
+        # canonical tick dicts.
+        return {}
+
+    def to_canonical(self) -> Dict:
+        """Return a canonical engine-facing tick dict (primitive types).
+
+        This prevents dataclass instances from being passed into the
+        realtime/state boundary. Fields match the canonical schema.
+        """
+        try:
+            ts = float(getattr(self, "time_msc", 0)) / 1000.0
+        except Exception:
+            ts = float(getattr(self, "time", time.time()))
+
+        volume = 0.0
+        try:
+            volume = float(int(getattr(self, "bid_volume", 0)) + int(getattr(self, "ask_volume", 0)))
+        except Exception:
+            volume = 0.0
+
+        return {
+            "symbol": str(self.symbol),
+            "timestamp": float(ts),
+            "bid": float(self.bid),
+            "ask": float(self.ask),
+            "last": float(self.last),
+            "volume": float(volume),
+            "source": "mt5",
         }
-        
-        if self.stop_loss is not None and self.stop_loss > 0:
-            request["sl"] = self.stop_loss
-        
-        if self.take_profit is not None and self.take_profit > 0:
-            request["tp"] = self.take_profit
-        
-        return request
 
 
 @dataclass
@@ -735,7 +776,8 @@ class MT5Orders:
     
     def _mock_tick(self, symbol: str):
         """Generate mock tick"""
-        return MockTickData(symbol=symbol)
+        # Return a primitive canonical dict (do NOT return the dataclass)
+        return MockTickData(symbol=symbol).to_canonical()
 
 
 if __name__ == '__main__':

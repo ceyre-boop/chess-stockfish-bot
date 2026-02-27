@@ -1,47 +1,38 @@
 #!/usr/bin/env python3
 """
-MT5 Live Feed Module - Trading Stockfish
+MT5 Live Feed (Engine-facing) - Trading Stockfish
 
-Manages MetaTrader5 connection and provides real-time market data feeds.
-Handles ticks, candles, and symbol information with automatic reconnection.
+Engine-facing layer only. This module MUST NOT return dataclasses,
+SDK objects, or mock/demo data. All outputs are primitive/canonical dicts.
 
-Features:
-- Persistent MT5 connection management
-- Automatic reconnection with exponential backoff
-- Multi-timeframe candle fetching
-- Tick data with spread calculation
-- Data validation and staleness detection
-- Structured data objects ready for state_builder
+Exports:
+- MT5LiveFeed: methods get_tick, get_symbol_info, get_candles, get_multitf_candles
+
+Behavioral guarantees:
+- Only emit canonical dicts: {symbol,timestamp,bid,ask,last,volume,source}
+- Drop invalid or missing timestamps (no fabrication)
+- Enforce per-symbol monotonic timestamps (drop non-monotonic)
 """
+
+from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Any
 
 try:
     import MetaTrader5 as mt5
 
     MT5_AVAILABLE = True
-except ImportError:
+except Exception:
     MT5_AVAILABLE = False
-    logging.warning("MetaTrader5 not available - will run in mock mode")
 
-# Configure logging
-logging.basicConfig(
-    level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-# Timeframe mapping
-TIMEFRAMES = {
-    "M1": 1,
-    "M5": 5,
-    "M15": 15,
-    "H1": 60,
-}
+# Timeframe mapping (minutes)
+TIMEFRAMES = {"M1": 1, "M5": 5, "M15": 15, "H1": 60}
 
 MT5_TIMEFRAMES = {
     "M1": mt5.TIMEFRAME_M1 if MT5_AVAILABLE else 1,
@@ -51,99 +42,7 @@ MT5_TIMEFRAMES = {
 }
 
 
-# Data Classes for structured returns
-@dataclass
-class TickData:
-    """Represents a single tick in market data"""
-
-    symbol: str
-    bid: float
-    ask: float
-    bid_volume: int
-    ask_volume: int
-    last: float
-    time: int
-    time_msc: int
-
-    @property
-    def spread(self) -> float:
-        """Calculate spread in pips (for EURUSD, GBPUSD, etc.)"""
-        return (self.ask - self.bid) * 10000
-
-    @property
-    def mid_price(self) -> float:
-        """Midpoint between bid and ask"""
-        return (self.bid + self.ask) / 2
-
-
-@dataclass
-class SymbolInfo:
-    """Symbol information and trading parameters"""
-
-    symbol: str
-    digits: int  # Decimal places (5 for EURUSD)
-    point: float  # Minimum price change (0.00001 for EURUSD)
-    bid: float  # Current bid
-    ask: float  # Current ask
-    volume_min: float  # Minimum position size
-    volume_max: float  # Maximum position size
-    volume_step: float  # Position size increment
-    swap_long: float  # Swap for long positions
-    swap_short: float  # Swap for short positions
-    commission: float  # Commission per trade
-    spread: float  # Current spread in pips
-
-    def format_price(self, price: float) -> str:
-        """Format price with correct decimal places"""
-        format_str = f"{{:.{self.digits}f}}"
-        return format_str.format(price)
-
-    def round_lot(self, volume: float) -> float:
-        """Round volume to nearest valid lot size"""
-        if self.volume_step == 0:
-            return volume
-        rounded = round(volume / self.volume_step) * self.volume_step
-        return max(self.volume_min, min(rounded, self.volume_max))
-
-
-@dataclass
-class CandleData:
-    """OHLC candle data for a specific timeframe"""
-
-    symbol: str
-    timeframe: str  # 'M1', 'M5', 'M15', 'H1', etc.
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: int
-    time: int  # Unix timestamp
-    count: int  # Number of candles fetched
-
-    @property
-    def range(self) -> float:
-        """High-Low range"""
-        return self.high - self.low
-
-    @property
-    def body(self) -> float:
-        """Open-Close range (candle body)"""
-        return abs(self.close - self.open)
-
-    @property
-    def direction(self) -> str:
-        """Candle direction: 'up', 'down', or 'doji'"""
-        if self.close > self.open:
-            return "up"
-        elif self.close < self.open:
-            return "down"
-        else:
-            return "doji"
-
-
 class ConnectionStatus(Enum):
-    """MT5 connection states"""
-
     DISCONNECTED = "disconnected"
     CONNECTING = "connecting"
     CONNECTED = "connected"
@@ -151,30 +50,19 @@ class ConnectionStatus(Enum):
 
 
 class LiveFeedError(Exception):
-    """Base exception for live feed errors"""
-
     pass
 
 
 class ConnectionError(LiveFeedError):
-    """MT5 connection error"""
-
     pass
 
 
 class DataValidationError(LiveFeedError):
-    """Data validation error"""
-
     pass
 
 
 class MT5LiveFeed:
-    """
-    Manages MetaTrader5 connection and data fetching.
-
-    Handles reconnection, data validation, and provides consistent
-    structured data objects for state building.
-    """
+    """Engine-facing MT5 live feed. Returns only canonical dicts."""
 
     def __init__(
         self,
@@ -185,17 +73,6 @@ class MT5LiveFeed:
         retry_delay: float = 1.0,
         use_demo: bool = False,
     ):
-        """
-        Initialize MT5 Live Feed.
-
-        Args:
-            account: MT5 account number (optional, uses default if None)
-            password: MT5 password (optional)
-            server: MT5 server name (optional)
-            max_retries: Maximum connection retry attempts
-            retry_delay: Initial retry delay in seconds (grows exponentially)
-            use_demo: Use mock data instead of live MT5 (for testing)
-        """
         self.account = account
         self.password = password
         self.server = server
@@ -208,400 +85,379 @@ class MT5LiveFeed:
         self.last_connection_time: Optional[float] = None
         self.connection_attempts = 0
 
-        # Symbol cache
-        self._symbol_cache: Dict[str, SymbolInfo] = {}
+        # symbol -> primitive symbol info dict cache
+        self._symbol_cache: Dict[str, Dict[str, Any]] = {}
         self._cache_timestamp: Dict[str, float] = {}
-        self._cache_ttl = 60  # Cache symbol info for 60 seconds
+        self._cache_ttl = 60
 
-        logger.info("MT5LiveFeed initialized")
+        # per-symbol last-seen values to enforce monotonicity and detect duplicates
+        # each entry is a dict: {'ts': float, 'bid': float, 'ask': float, 'last': float, 'volume': float}
+        self._last_tick_ts_by_symbol: Dict[str, Dict[str, Any]] = {}
 
-        # Only connect if not in demo/mock mode
+        logger.info("MT5LiveFeed (engine) initialized")
+
         if not self.use_demo:
             self.connect()
 
     def connect(self) -> bool:
-        """
-        Establish connection to MetaTrader5.
-
-        Returns:
-            True if connected, False otherwise
-        """
         if not MT5_AVAILABLE:
-            logger.warning("MT5 not available - running in mock mode")
-            self.status = ConnectionStatus.CONNECTED
-            self.last_connection_time = time.time()
-            return True
+            logger.warning("MT5 not available - engine feed will be disabled")
+            self.status = ConnectionStatus.ERROR
+            return False
 
         if self.status == ConnectionStatus.CONNECTED:
             return True
 
         self.status = ConnectionStatus.CONNECTING
         self.connection_attempts = 0
-
         while self.connection_attempts < self.max_retries:
             try:
                 self.connection_attempts += 1
-                delay = min(self.retry_delay * (2**self.connection_attempts), 30)
-
-                logger.debug(
-                    f"MT5 connection attempt {self.connection_attempts}/{self.max_retries}"
-                )
-
                 if mt5.initialize():
-                    logger.info("MT5 connected successfully")
                     self.status = ConnectionStatus.CONNECTED
                     self.last_connection_time = time.time()
                     self.last_error = None
+                    logger.info("MT5 connected (engine)")
                     return True
                 else:
-                    error_code, error_msg = mt5.last_error()
-                    self.last_error = f"{error_code}: {error_msg}"
-                    logger.warning(f"MT5 init failed: {self.last_error}")
-
-                    if self.connection_attempts < self.max_retries:
-                        logger.debug(f"Retrying in {delay:.1f} seconds...")
-                        time.sleep(delay)
-
+                    err = mt5.last_error()
+                    self.last_error = str(err)
+                    logger.warning("MT5 initialize failed: %s", err)
+                    time.sleep(min(self.retry_delay * (2**self.connection_attempts), 30))
             except Exception as e:
                 self.last_error = str(e)
-                logger.error(f"Connection exception: {e}")
-                if self.connection_attempts < self.max_retries:
-                    time.sleep(self.retry_delay)
+                logger.error("MT5 connect exception: %s", e)
+                time.sleep(self.retry_delay)
 
         self.status = ConnectionStatus.ERROR
-        logger.error(f"Failed to connect after {self.max_retries} attempts")
         return False
 
-    def disconnect(self):
-        """Safely disconnect from MetaTrader5"""
+    def disconnect(self) -> None:
         if MT5_AVAILABLE:
             try:
                 mt5.shutdown()
-                logger.info("MT5 disconnected")
-            except Exception as e:
-                logger.error(f"Disconnect error: {e}")
-
+            except Exception:
+                pass
         self.status = ConnectionStatus.DISCONNECTED
 
     def is_connected(self) -> bool:
-        """Check if currently connected to MT5"""
-        if self.use_demo:
-            return True
         return self.status == ConnectionStatus.CONNECTED
 
-    def get_tick(self, symbol: str) -> Optional[TickData]:
-        """
-        Fetch current tick data for a symbol.
+    def _parse_tick_ts(self, tick_obj) -> Optional[float]:
+        """Parse common mt5 tick timestamp fields into float seconds or None."""
+        try:
+            t_msc = getattr(tick_obj, "time_msc", None)
+            # Always prefer time_msc for ms precision. Fallback to 'time' only if time_msc missing.
+            if t_msc is not None and int(t_msc) > 0:
+                return float(int(t_msc)) / 1000.0
+            # Fallback: try 'time' but do not truncate (preserve float if present)
+            t_s = getattr(tick_obj, "time", None)
+            if t_s is not None:
+                return float(t_s)
+        except Exception:
+            return None
+        return None
 
-        Args:
-            symbol: Trading symbol (e.g., 'EURUSD')
-
-        Returns:
-            TickData object or None if failed
-        """
+    def get_tick(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Return canonical tick dict or None. Never returns mocks or dataclasses."""
         if self.use_demo:
-            return self._mock_tick(symbol)
+            logger.warning("Engine-facing get_tick() will not return demo/mock ticks")
+            return None
 
         if not self.is_connected():
-            logger.warning(f"Not connected, cannot fetch tick for {symbol}")
+            logger.warning("Not connected, cannot fetch tick for %s", symbol)
+            return None
+
+        if not MT5_AVAILABLE:
             return None
 
         try:
-            if not MT5_AVAILABLE:
-                return None
-
             tick = mt5.symbol_info_tick(symbol)
-
             if tick is None:
-                logger.warning(f"No tick data available for {symbol}")
+                logger.debug("No tick data for %s", symbol)
                 return None
 
-            tick_data = TickData(
-                symbol=symbol,
-                bid=tick.bid,
-                ask=tick.ask,
-                bid_volume=tick.bid_volume,
-                ask_volume=tick.ask_volume,
-                last=tick.last,
-                time=tick.time,
-                time_msc=tick.time_msc,
-            )
+            # Capture raw fields for tracing
+            try:
+                raw_time = getattr(tick, "time", None)
+                raw_time_msc = getattr(tick, "time_msc", None)
+                raw_last = getattr(tick, "last", None)
+                raw_bid = getattr(tick, "bid", None)
+                raw_ask = getattr(tick, "ask", None)
+            except Exception:
+                raw_time = raw_time_msc = raw_last = raw_bid = raw_ask = None
 
-            logger.debug(
-                f"{symbol} tick: bid={tick.bid:.5f}, ask={tick.ask:.5f}, spread={tick_data.spread:.1f}pips"
-            )
-            return tick_data
+            bid_vol = getattr(tick, "bid_volume", 0) or 0
+            ask_vol = getattr(tick, "ask_volume", 0) or 0
 
+            ts = self._parse_tick_ts(tick)
+            if ts is None:
+                logger.warning("MT5 tick missing timestamp; dropping event for %s", symbol)
+                return None
+
+            # compute volume and canonical dict early so we can update last-seen consistently
+            try:
+                volume = float(getattr(tick, "volume", float(int(bid_vol) + int(ask_vol))))
+            except Exception:
+                volume = float(int(bid_vol) + int(ask_vol))
+
+            canonical = {
+                "symbol": symbol,
+                "timestamp": float(ts),
+                "bid": float(getattr(tick, "bid", 0.0)),
+                "ask": float(getattr(tick, "ask", 0.0)),
+                "last": float(getattr(tick, "last", 0.0)),
+                "volume": float(volume),
+                "source": "mt5",
+            }
+
+            prev = self._last_tick_ts_by_symbol.get(symbol)
+            if prev is not None and isinstance(prev, dict):
+                try:
+                    prev_ts = float(prev.get("ts"))
+                except Exception:
+                    prev_ts = None
+                prev_bid = prev.get("bid")
+                prev_ask = prev.get("ask")
+                prev_last = prev.get("last")
+                prev_vol = prev.get("volume")
+            else:
+                prev_ts = prev_bid = prev_ask = prev_last = prev_vol = None
+
+            if prev_ts is not None and ts < prev_ts:
+                try:
+                    delta = float(ts) - float(prev_ts)
+                except Exception:
+                    delta = None
+                logger.error(
+                    "MT5 timestamp tracing: symbol=%s raw.time=%s raw.time_msc=%s raw.last=%s raw.bid=%s raw.ask=%s parsed_ts=%s prev_ts=%s delta=%s",
+                    symbol,
+                    raw_time,
+                    raw_time_msc,
+                    raw_last,
+                    raw_bid,
+                    raw_ask,
+                    ts,
+                    prev_ts,
+                    delta,
+                )
+                logger.warning("Non-monotonic tick ts for %s: %s < %s; dropping", symbol, ts, prev_ts)
+                return None
+
+            # Equal timestamps: accept only if market content changed
+            if prev_ts is not None and ts == prev_ts:
+                try:
+                    vol = float(canonical.get("volume", 0.0))
+                except Exception:
+                    vol = None
+                try:
+                    if (
+                        float(canonical.get("bid", 0.0)) == float(prev_bid or 0.0)
+                        and float(canonical.get("ask", 0.0)) == float(prev_ask or 0.0)
+                        and float(canonical.get("last", 0.0)) == float(prev_last or 0.0)
+                        and (vol is None or float(prev_vol or 0.0) == vol)
+                    ):
+                        logging.getLogger('trading_engine').info(
+                            "MT5 timestamp trace OK: symbol=%s raw.time=%s raw.time_msc=%s raw.last=%s raw.bid=%s raw.ask=%s parsed_ts=%s prev_ts=%s delta=%s",
+                            symbol,
+                            raw_time,
+                            raw_time_msc,
+                            raw_last,
+                            raw_bid,
+                            raw_ask,
+                            ts,
+                            prev_ts,
+                            0.0,
+                        )
+                        logger.info("MT5 timestamp tracing: duplicate tick for %s at ts=%s; dropping", symbol, ts)
+                        return None
+                    # else accepted (content changed)
+                except Exception:
+                    pass
+
+            # Log successful parsed tick and update last_ts
+            try:
+                delta_ok = float(ts) - float(prev_ts) if prev_ts is not None else None
+            except Exception:
+                delta_ok = None
+            # Emit to central trading_engine logger so harness log captures it
+            logging.getLogger('trading_engine').info(
+                "MT5 timestamp trace OK: symbol=%s raw.time=%s raw.time_msc=%s raw.last=%s raw.bid=%s raw.ask=%s parsed_ts=%s prev_ts=%s delta=%s",
+                symbol,
+                raw_time,
+                raw_time_msc,
+                raw_last,
+                raw_bid,
+                raw_ask,
+                ts,
+                prev_ts,
+                delta_ok,
+            )
+            # update last-seen fields only when tick accepted
+            try:
+                self._last_tick_ts_by_symbol[symbol] = {
+                    'ts': float(ts),
+                    'bid': float(canonical.get('bid', 0.0)),
+                    'ask': float(canonical.get('ask', 0.0)),
+                    'last': float(canonical.get('last', 0.0)),
+                    'volume': float(canonical.get('volume', 0.0)),
+                }
+            except Exception:
+                self._last_tick_ts_by_symbol[symbol] = {'ts': float(ts)}
+
+            return canonical
         except Exception as e:
-            logger.error(f"Error fetching tick for {symbol}: {e}")
+            logger.error("Error fetching tick for %s: %s", symbol, e)
             return None
 
-    def get_symbol_info(
-        self, symbol: str, use_cache: bool = True
-    ) -> Optional[SymbolInfo]:
-        """
-        Fetch symbol information and trading parameters.
-
-        Args:
-            symbol: Trading symbol
-            use_cache: Use cached info if available
-
-        Returns:
-            SymbolInfo object or None if failed
-        """
+    def get_symbol_info(self, symbol: str, use_cache: bool = True) -> Optional[Dict[str, Any]]:
+        """Return primitive symbol info dict or None (no dataclasses)."""
         if self.use_demo:
-            return self._mock_symbol_info(symbol)
+            logger.warning("Engine-facing get_symbol_info() will not return demo data")
+            return None
 
-        # Check cache
         if use_cache and symbol in self._symbol_cache:
             cache_age = time.time() - self._cache_timestamp.get(symbol, 0)
             if cache_age < self._cache_ttl:
-                logger.debug(f"Using cached symbol info for {symbol}")
                 return self._symbol_cache[symbol]
 
         if not self.is_connected():
-            logger.warning(f"Not connected, cannot fetch symbol info for {symbol}")
+            logger.warning("Not connected, cannot fetch symbol info for %s", symbol)
+            return None
+
+        if not MT5_AVAILABLE:
             return None
 
         try:
-            if not MT5_AVAILABLE:
-                return None
-
             info = mt5.symbol_info(symbol)
             if info is None:
-                logger.warning(f"No symbol info available for {symbol}")
                 return None
 
-            # Get current tick for bid/ask
             tick = mt5.symbol_info_tick(symbol)
-            if tick is None:
-                logger.warning(f"No tick data for {symbol}, using symbol info prices")
-                bid = info.bid
-                ask = info.ask
-            else:
-                bid = tick.bid
-                ask = tick.ask
+            bid = getattr(tick, "bid", getattr(info, "bid", 0.0))
+            ask = getattr(tick, "ask", getattr(info, "ask", 0.0))
 
-            symbol_info = SymbolInfo(
-                symbol=symbol,
-                digits=info.digits,
-                point=info.point,
-                bid=bid,
-                ask=ask,
-                volume_min=info.volume_min,
-                volume_max=info.volume_max,
-                volume_step=info.volume_step,
-                swap_long=info.swap_long,
-                swap_short=info.swap_short,
-                commission=info.commission,
-                spread=(ask - bid) * (10**info.digits),
-            )
+            sym = {
+                "symbol": symbol,
+                "digits": int(getattr(info, "digits", 5)),
+                "point": float(getattr(info, "point", 0.00001)),
+                "bid": float(bid),
+                "ask": float(ask),
+                "volume_min": float(getattr(info, "volume_min", 0.01)),
+                "volume_max": float(getattr(info, "volume_max", 100.0)),
+                "volume_step": float(getattr(info, "volume_step", 0.01)),
+                "swap_long": float(getattr(info, "swap_long", 0.0)),
+                "swap_short": float(getattr(info, "swap_short", 0.0)),
+                "commission": float(getattr(info, "commission", 0.0)),
+                "spread": float((float(ask) - float(bid)) * (10 ** int(getattr(info, "digits", 5)))),
+            }
 
-            # Cache it
-            self._symbol_cache[symbol] = symbol_info
+            self._symbol_cache[symbol] = sym
             self._cache_timestamp[symbol] = time.time()
-
-            logger.debug(
-                f"Symbol info for {symbol}: digits={info.digits}, volume_min={info.volume_min}, volume_max={info.volume_max}"
-            )
-            return symbol_info
-
+            return sym
         except Exception as e:
-            logger.error(f"Error fetching symbol info for {symbol}: {e}")
+            logger.error("Error fetching symbol info for %s: %s", symbol, e)
             return None
 
-    def get_candles(
-        self,
-        symbol: str,
-        timeframe: str,
-        count: int = 100,
-        offset: int = 0,
-    ) -> Optional[List[CandleData]]:
-        """
-        Fetch candle data for a symbol and timeframe.
-
-        Args:
-            symbol: Trading symbol
-            timeframe: Timeframe code ('M1', 'M5', 'M15', 'H1')
-            count: Number of candles to fetch
-            offset: Offset from current candle (0 = current, 1 = previous, etc.)
-
-        Returns:
-            List of CandleData objects or None if failed
-        """
+    def get_candles(self, symbol: str, timeframe: str, count: int = 100, offset: int = 0) -> Optional[List[Dict[str, Any]]]:
+        """Return list of primitive candle dicts or None."""
         if self.use_demo:
-            return self._mock_candles(symbol, timeframe, count)
+            logger.warning("Engine-facing get_candles() will not return demo data")
+            return None
 
         if not self.is_connected():
-            logger.warning(
-                f"Not connected, cannot fetch candles for {symbol} {timeframe}"
-            )
+            logger.warning("Not connected, cannot fetch candles for %s %s", symbol, timeframe)
+            return None
+
+        if not MT5_AVAILABLE or timeframe not in MT5_TIMEFRAMES:
+            logger.error("Invalid timeframe or MT5 unavailable: %s", timeframe)
             return None
 
         try:
-            if not MT5_AVAILABLE or timeframe not in MT5_TIMEFRAMES:
-                logger.error(f"Invalid timeframe: {timeframe}")
-                return None
-
             mt5_tf = MT5_TIMEFRAMES[timeframe]
-
-            # Fetch candles from offset position
-            candles = mt5.copy_rates_from_pos(symbol, mt5_tf, offset, count)
-
-            if candles is None or len(candles) == 0:
-                logger.warning(f"No candle data for {symbol} {timeframe}")
+            raw = mt5.copy_rates_from_pos(symbol, mt5_tf, offset, count)
+            if raw is None or len(raw) == 0:
+                logger.warning("No candle data for %s %s", symbol, timeframe)
                 return None
 
-            # Convert to CandleData objects
-            candle_list = []
-            for i, candle in enumerate(candles):
-                cd = CandleData(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    open=float(candle["open"]),
-                    high=float(candle["high"]),
-                    low=float(candle["low"]),
-                    close=float(candle["close"]),
-                    volume=int(candle["tick_volume"]),
-                    time=int(candle["time"]),
-                    count=len(candles),
-                )
-                candle_list.append(cd)
+            candle_list: List[Dict[str, Any]] = []
+            for candle in raw:
+                # Prefer ms timestamp if available, else fall back to seconds 'time'
+                if candle.get("time_msc"):
+                    try:
+                        ts = float(int(candle.get("time_msc"))) / 1000.0
+                    except Exception:
+                        ts = float(candle.get("time", 0))
+                else:
+                    ts = float(candle.get("time", 0))
+                candle_list.append({
+                    "symbol": symbol,
+                    "timeframe": timeframe,
+                    "open": float(candle.get("open", 0.0)),
+                    "high": float(candle.get("high", 0.0)),
+                    "low": float(candle.get("low", 0.0)),
+                    "close": float(candle.get("close", 0.0)),
+                    "volume": int(candle.get("tick_volume", 0)),
+                    "timestamp": ts,
+                    "source": "mt5",
+                })
 
-            logger.debug(
-                f"{symbol} {timeframe}: fetched {len(candle_list)} candles, latest close={candles[-1]['close']:.5f}"
-            )
             return candle_list
-
         except Exception as e:
-            logger.error(f"Error fetching candles for {symbol} {timeframe}: {e}")
+            logger.error("Error fetching candles for %s %s: %s", symbol, timeframe, e)
             return None
 
-    def get_latest_candle(self, symbol: str, timeframe: str) -> Optional[CandleData]:
-        """
-        Fetch only the latest candle for a symbol and timeframe.
-
-        Args:
-            symbol: Trading symbol
-            timeframe: Timeframe code
-
-        Returns:
-            CandleData object (latest candle) or None if failed
-        """
+    def get_latest_candle(self, symbol: str, timeframe: str) -> Optional[Dict[str, Any]]:
         candles = self.get_candles(symbol, timeframe, count=1)
         if candles and len(candles) > 0:
             return candles[0]
         return None
 
-    def get_multitf_candles(
-        self,
-        symbol: str,
-        timeframes: Optional[List[str]] = None,
-        count: int = 100,
-    ) -> Optional[Dict[str, List[CandleData]]]:
-        """
-        Fetch candles for multiple timeframes at once.
-
-        Args:
-            symbol: Trading symbol
-            timeframes: List of timeframe codes (default: ['M1', 'M5', 'M15', 'H1'])
-            count: Candles per timeframe
-
-        Returns:
-            Dict of {timeframe: List[CandleData]} or None if any failed
-        """
+    def get_multitf_candles(self, symbol: str, timeframes: Optional[List[str]] = None, count: int = 100) -> Optional[Dict[str, Optional[List[Dict[str, Any]]]]]:
         if timeframes is None:
             timeframes = ["M1", "M5", "M15", "H1"]
-
-        results = {}
+        results: Dict[str, Optional[List[Dict[str, Any]]]] = {}
         for tf in timeframes:
-            candles = self.get_candles(symbol, tf, count=count)
-            if candles is None:
-                logger.warning(f"Failed to fetch {tf} candles for {symbol}")
-                results[tf] = None
-            else:
-                results[tf] = candles
-
-        logger.debug(f"Multi-TF candles fetched for {symbol}: {list(results.keys())}")
+            results[tf] = self.get_candles(symbol, tf, count=count)
         return results
 
-    def validate_tick(self, tick: TickData, max_age_sec: int = 60) -> Tuple[bool, str]:
-        """
-        Validate tick data for staleness and consistency.
-
-        Args:
-            tick: TickData object to validate
-            max_age_sec: Maximum age in seconds before considered stale
-
-        Returns:
-            Tuple of (is_valid: bool, reason: str)
-        """
+    def validate_tick(self, tick: Optional[Dict[str, Any]], max_age_sec: int = 60) -> (bool, str):
         if tick is None:
             return False, "Tick is None"
+        try:
+            ts = float(tick.get("timestamp", 0))
+            bid = float(tick.get("bid", 0))
+            ask = float(tick.get("ask", 0))
+        except Exception:
+            return False, "Malformed tick structure"
 
-        age = time.time() - tick.time
+        age = time.time() - ts
         if age > max_age_sec:
             return False, f"Tick is stale: {age:.1f}s old"
-
-        if tick.bid >= tick.ask:
-            return False, "Invalid bid/ask: bid >= ask"
-
-        if tick.bid <= 0 or tick.ask <= 0:
-            return False, "Invalid bid/ask: negative or zero"
-
-        if tick.spread > 100:  # Sanity check for extreme spread
-            return False, f"Spread too wide: {tick.spread:.1f} pips"
-
+        if bid <= 0 or ask <= 0 or bid >= ask:
+            return False, "Invalid bid/ask"
         return True, "Tick valid"
 
-    def validate_candles(
-        self,
-        candles: Optional[List[CandleData]],
-        min_count: int = 20,
-        max_age_sec: int = 300,
-    ) -> Tuple[bool, str]:
-        """
-        Validate candle data.
-
-        Args:
-            candles: List of CandleData objects
-            min_count: Minimum required candles
-            max_age_sec: Maximum age of latest candle
-
-        Returns:
-            Tuple of (is_valid: bool, reason: str)
-        """
+    def validate_candles(self, candles: Optional[List[Dict[str, Any]]], min_count: int = 20, max_age_sec: int = 300) -> (bool, str):
         if candles is None:
             return False, "Candles is None"
-
-        if len(candles) == 0:
-            return False, "No candles"
-
         if len(candles) < min_count:
             return False, f"Insufficient candles: {len(candles)} < {min_count}"
-
         latest = candles[-1]
-        age = time.time() - latest.time
+        age = time.time() - float(latest.get("timestamp", 0))
         if age > max_age_sec:
             return False, f"Candles stale: {age:.1f}s old"
-
-        # Check for valid OHLC
-        for candle in candles[-5:]:  # Check last 5 candles
-            if candle.high < candle.low:
-                return False, f"Invalid candle: high < low"
-            if candle.open < candle.low or candle.open > candle.high:
-                return False, f"Invalid candle: open outside range"
-            if candle.close < candle.low or candle.close > candle.high:
-                return False, f"Invalid candle: close outside range"
-
+        for c in candles[-5:]:
+            high = float(c.get("high", 0))
+            low = float(c.get("low", 0))
+            if high < low:
+                return False, "Invalid candle: high < low"
         return True, "Candles valid"
 
-    def get_connection_status(self) -> Dict:
-        """Get current connection status and diagnostics"""
+    def get_connection_status(self) -> Dict[str, Any]:
         uptime = None
         if self.last_connection_time:
             uptime = time.time() - self.last_connection_time
-
         return {
             "status": self.status.value,
             "is_connected": self.is_connected(),
@@ -611,173 +467,19 @@ class MT5LiveFeed:
             "use_demo": self.use_demo,
         }
 
-    def _mock_tick(self, symbol: str) -> TickData:
-        """Generate mock tick data for testing"""
-        base_prices = {
-            "EURUSD": 1.0850,
-            "GBPUSD": 1.2750,
-            "USDJPY": 149.50,
-            "AUDUSD": 0.6850,
-        }
 
-        base = base_prices.get(symbol, 1.0850)
-        return TickData(
-            symbol=symbol,
-            bid=base,
-            ask=base + 0.0002,
-            bid_volume=1000,
-            ask_volume=1000,
-            last=base,
-            time=int(time.time()),
-            time_msc=int(time.time() * 1000),
-        )
-
-    def _mock_symbol_info(self, symbol: str) -> SymbolInfo:
-        """Generate mock symbol info for testing"""
-        return SymbolInfo(
-            symbol=symbol,
-            digits=5,
-            point=0.00001,
-            bid=1.0850,
-            ask=1.0852,
-            volume_min=0.01,
-            volume_max=100.0,
-            volume_step=0.01,
-            swap_long=-5.0,
-            swap_short=-3.0,
-            commission=0.0,
-            spread=2.0,
-        )
-
-    def _mock_candles(
-        self, symbol: str, timeframe: str, count: int
-    ) -> List[CandleData]:
-        """Generate mock candle data for testing"""
-        candles = []
-        base_price = 1.0850
-        current_time = int(time.time())
-
-        for i in range(count):
-            # Generate realistic OHLC
-            open_p = base_price + (i * 0.0001)
-            close_p = open_p + 0.00005
-            high_p = max(open_p, close_p) + 0.00008
-            low_p = min(open_p, close_p) - 0.00005
-
-            candles.append(
-                CandleData(
-                    symbol=symbol,
-                    timeframe=timeframe,
-                    open=open_p,
-                    high=high_p,
-                    low=low_p,
-                    close=close_p,
-                    volume=1000,
-                    time=current_time - (count - i) * TIMEFRAMES[timeframe] * 60,
-                    count=count,
-                )
-            )
-
-        return candles
-
-
-# Global instance
+# global instance helpers
 _live_feed: Optional[MT5LiveFeed] = None
 
 
 def initialize_feed(use_demo: bool = False) -> MT5LiveFeed:
-    """Initialize global live feed instance"""
     global _live_feed
     _live_feed = MT5LiveFeed(use_demo=use_demo)
     return _live_feed
 
 
 def get_feed() -> MT5LiveFeed:
-    """Get global live feed instance"""
     global _live_feed
     if _live_feed is None:
         _live_feed = initialize_feed()
     return _live_feed
-
-
-if __name__ == "__main__":
-    """Example usage and testing"""
-
-    print("\n" + "=" * 70)
-    print("MT5 LIVE FEED - TEST RUN")
-    print("=" * 70)
-
-    # Initialize with demo mode
-    feed = MT5LiveFeed(use_demo=True)
-
-    # Test 1: Connection status
-    print("\n[TEST 1] Connection Status")
-    status = feed.get_connection_status()
-    print(f"Status: {status['status']}")
-    print(f"Connected: {status['is_connected']}")
-
-    # Test 2: Fetch tick data
-    print("\n[TEST 2] Fetch Tick Data")
-    tick = feed.get_tick("EURUSD")
-    if tick:
-        print(f"Symbol: {tick.symbol}")
-        print(f"Bid: {tick.bid:.5f}")
-        print(f"Ask: {tick.ask:.5f}")
-        print(f"Spread: {tick.spread:.2f} pips")
-        print(f"Mid: {tick.mid_price:.5f}")
-
-        # Validate
-        is_valid, reason = feed.validate_tick(tick)
-        print(f"Validation: {reason}")
-
-    # Test 3: Fetch symbol info
-    print("\n[TEST 3] Symbol Info")
-    symbol_info = feed.get_symbol_info("EURUSD")
-    if symbol_info:
-        print(f"Symbol: {symbol_info.symbol}")
-        print(f"Digits: {symbol_info.digits}")
-        print(f"Point: {symbol_info.point}")
-        print(f"Volume Min: {symbol_info.volume_min}")
-        print(f"Volume Max: {symbol_info.volume_max}")
-        print(f"Spread: {symbol_info.spread:.2f} pips")
-
-    # Test 4: Fetch candles
-    print("\n[TEST 4] Fetch Candles (H1)")
-    candles = feed.get_candles("EURUSD", "H1", count=5)
-    if candles:
-        print(f"Fetched {len(candles)} candles")
-        latest = candles[-1]
-        print(f"Latest H1:")
-        print(
-            f"  OHLC: {latest.open:.5f} / {latest.high:.5f} / {latest.low:.5f} / {latest.close:.5f}"
-        )
-        print(f"  Volume: {latest.volume}")
-        print(f"  Direction: {latest.direction}")
-
-        # Validate
-        is_valid, reason = feed.validate_candles(candles, min_count=3)
-        print(f"Validation: {reason}")
-
-    # Test 5: Multi-timeframe candles
-    print("\n[TEST 5] Multi-Timeframe Candles")
-    mtf = feed.get_multitf_candles(
-        "EURUSD", timeframes=["M1", "M5", "M15", "H1"], count=3
-    )
-    if mtf:
-        for tf, candles in mtf.items():
-            if candles:
-                print(
-                    f"{tf}: {len(candles)} candles, latest close={candles[-1].close:.5f}"
-                )
-            else:
-                print(f"{tf}: No data")
-
-    # Test 6: Disconnect
-    print("\n[TEST 6] Disconnect")
-    feed.disconnect()
-    status = feed.get_connection_status()
-    print(f"Status after disconnect: {status['status']}")
-
-    print("\n" + "=" * 70)
-    print("TESTS COMPLETE")
-    print("=" * 70 + "\n")

@@ -8,6 +8,7 @@ from .entry_brain import BrainPolicy
 from .entry_models import EntryModelSpec
 from .ev_brain_model import EVBrainV1
 from .opening_book import OpeningBookV1
+from .search.search_engine_regime_adapter import RegimeScoringWeights
 from .search_scoring import (
     apply_endgame_tablebases,
     apply_opening_book_scores,
@@ -45,6 +46,7 @@ class SearchEngineV1:
         entry_models: List[EntryModelSpec],
         risk_envelope: Any,
         template_policy: Dict[str, Any] | None = None,
+        regime_weights: RegimeScoringWeights | None = None,
     ) -> List[Tuple[DecisionAction, Dict[str, Any]]]:
         candidate_actions = generate_candidate_actions(
             frame,
@@ -65,6 +67,7 @@ class SearchEngineV1:
             horizon_bars=self.horizon_bars,
             seed=self.seed,
             table=self.tt,
+            regime_weights=regime_weights,
             template_policy=template_policy,
         )
 
@@ -77,6 +80,7 @@ class SearchEngineV1:
             position_state,
             actions,
             score_dicts,
+            weight=(regime_weights.opening_book_weight if regime_weights else 1.0),
         )
 
         apply_endgame_tablebases(

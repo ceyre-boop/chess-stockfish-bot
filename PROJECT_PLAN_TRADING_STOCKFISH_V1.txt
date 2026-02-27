@@ -1,0 +1,297 @@
+======================================================================
+TRADING STOCKFISH v1.0 — FAILURE-AWARE PROJECT PLAN
+A causal, adversarial, execution-honest, official-grade trading engine
+======================================================================
+
+This file defines the complete roadmap for building Trading Stockfish v1.0.
+It is designed to be read by GitHub Copilot inside VS Code to guide all
+future development. After each major task, return to this file to determine
+the next step. This roadmap is time-aware, failure-aware, and optimized for
+the fastest path to a robust, official-grade engine.
+
+----------------------------------------------------------------------
+0. CURRENT STATE SNAPSHOT
+----------------------------------------------------------------------
+
+The following components are already complete:
+
+- MarketStateBuilder (8 causal factors)
+- NewsMacroEngine (macro + news features)
+- CausalEvaluator (Stockfish-style evaluation, deterministic, explainable)
+- PolicyEngine (8 actions, risk-aware, regime-aware, deterministic)
+- Unified evaluation pipeline (evaluate_and_decide)
+- Integrated evaluator factory
+- RealDataTournament (real-data, time-causal)
+- ELO rating framework
+- Documentation and tests for PolicyEngine and integration
+
+You are currently at:
+"Complete causal engine that can play full games on historical data."
+
+Next steps focus on execution realism, risk governance, data integrity,
+health monitoring, tuning, and official-grade validation.
+
+----------------------------------------------------------------------
+1. PHASE 0.5 — BRUTALIZE THE CURRENT ENGINE (NO NEW INFRASTRUCTURE)
+----------------------------------------------------------------------
+
+Goal:
+Stress-test the current engine before building additional layers.
+
+Tasks:
+- Add a "brutal tournament" mode in run_elo_evaluation.py:
+  - Multi-year runs (2018–2024)
+  - Multi-symbol: ES 1m, NQ 1m, 1–2 FX pairs
+  - Regime-segmented stats (volatility, macro, risk-on/off)
+  - Walk-forward evaluation (yearly segments)
+
+- Run tournaments with the current engine (no tuning, no execution modeling).
+
+- Create file: CURRENT_ENGINE_FAILURE_MODES.md
+  Sections:
+    - Strong in:
+    - Weak in:
+    - Overtrades in:
+    - Undertrades in:
+    - Common bad patterns:
+
+Failure-aware notes:
+- If results look too good: assume missing costs or bias.
+- If results look bad: this is expected and useful.
+
+----------------------------------------------------------------------
+2. PHASE 1 — EXECUTION SIMULATOR + MINIMAL COST MODEL
+----------------------------------------------------------------------
+
+Goal:
+Make PnL and ELO honest enough not to lie, without over-engineering.
+
+Tasks:
+- Create engine/execution_simulator.py
+  Inputs:
+    - action, target_size
+    - mid price
+    - LiquidityState, VolatilityState
+    - symbol config (tick size, spread)
+  Outputs:
+    - actual fill price
+    - filled size (partial fills allowed)
+    - transaction cost
+    - updated PositionState
+
+- Execution model (v1):
+  - Spread: bid = mid - spread/2, ask = mid + spread/2
+  - Slippage: slippage = k * ATR * (size / liquidity_scale)
+  - Costs: fixed commission + optional per-notional fee
+
+- Integrate into RealDataTournament:
+  - All trades must go through ExecutionSimulator
+  - No mid-price fills in official mode
+
+- Add execution_config.yaml:
+  - spread per symbol
+  - slippage coefficient
+  - commission
+
+Failure-aware notes:
+- Do not over-engineer execution.
+- Re-run brutal tournaments after integration.
+
+----------------------------------------------------------------------
+3. PHASE 2 — DATA INTEGRITY LAYER + BIAS TESTS
+----------------------------------------------------------------------
+
+Goal:
+Ensure strict time-causality and prevent survivorship or lookahead bias.
+
+Tasks:
+- Create data/data_integrity.py:
+  - verify no future timestamps in features
+  - verify time-aligned joins
+  - verify no "as of now" fields leak future info
+
+- Create tiny hand-crafted datasets:
+  - a few days around a macro event
+  - manually define what data is visible at each timestamp
+
+- Add tests:
+  - tests/test_bias_time_causality.py
+  - tests/test_bias_survivorship.py
+
+- Enforce in official runs:
+  - official tournaments require data integrity checks to pass
+
+Failure-aware notes:
+- Any bias failure is a red alert.
+- Fix immediately before continuing.
+
+----------------------------------------------------------------------
+4. PHASE 3 — PORTFOLIO RISK MANAGER + BASIC GOVERNANCE (v1)
+----------------------------------------------------------------------
+
+Goal:
+Add simple global risk controls without overcomplicating correlations.
+
+Tasks:
+- Create engine/portfolio_risk_manager.py:
+  - Track:
+    - total capital
+    - per-symbol exposure
+    - total notional exposure
+    - realized/unrealized PnL
+  - Enforce:
+    - max exposure per symbol
+    - max total notional
+    - max daily loss (portfolio-wide)
+
+- Create engine/governance.py:
+  - Global kill switch:
+    - if daily loss > threshold:
+      - stop new entries
+      - optionally flatten positions
+
+- Integrate into RealDataTournament:
+  - Before applying any action:
+    - ask PortfolioRiskManager and Governance
+    - override action if not allowed
+
+Failure-aware notes:
+- Avoid double-counting risk.
+- Clear boundaries:
+  - PolicyEngine: per-position risk
+  - PortfolioRiskManager: cross-position risk
+  - Governance: meta-level kill switches
+
+----------------------------------------------------------------------
+5. PHASE 4 — ENGINE HEALTH MONITOR (SIMPLE, RISK-OFFICER STYLE)
+----------------------------------------------------------------------
+
+Goal:
+Make the engine self-aware without turning health into a hidden optimizer.
+
+Tasks:
+- Create engine/health_monitor.py:
+  Inputs:
+    - rolling PnL
+    - rolling Sharpe
+    - rolling drawdown
+    - regime labels
+    - expected performance bands
+  Outputs:
+    - health_status ∈ {HEALTHY, DEGRADED, CRITICAL}
+    - risk_multiplier ∈ {1.0, 0.5, 0.0}
+
+- Define rules BEFORE seeing results:
+  - If 3-month Sharpe < 0 in a regime → DEGRADED
+  - If drawdown > threshold → CRITICAL
+
+- Integrate:
+  - PolicyEngine scales max_position_size by risk_multiplier
+
+Failure-aware notes:
+- Health rules must not be tuned to maximize PnL.
+- Treat health monitor like a risk officer, not a strategist.
+
+----------------------------------------------------------------------
+6. PHASE 5 — REPLAY TOOLS + EXPERIMENT HARNESS (THE LAB)
+----------------------------------------------------------------------
+
+Goal:
+Enable deep understanding and controlled experimentation.
+
+Tasks:
+- Create analytics/replay_day.py:
+  - step through a day candle-by-candle
+  - show:
+    - MarketState
+    - eval
+    - policy decision
+    - PnL
+    - reasoning
+    - risk state
+    - position state
+
+- Create analytics/experiment_runner.py:
+  - run controlled experiments:
+    - macro weight variations
+    - FOMC trade bans
+    - reversal threshold changes
+    - cooldown changes
+  - store results in experiments/:
+    - config.json
+    - results.json
+    - summary.md
+
+Failure-aware notes:
+- Use experiments to understand behavior, not to overfit.
+
+----------------------------------------------------------------------
+7. PHASE 6 — MANUAL TUNING FIRST, ML TUNER LATER
+----------------------------------------------------------------------
+
+Goal:
+Improve ELO and robustness without breaking causality.
+
+Tasks:
+- Manual tuning loop:
+  - adjust CausalEvaluator weights
+  - adjust PolicyEngine thresholds
+  - adjust RiskConfig
+  - validate with:
+    - regime-segmented ELO
+    - walk-forward
+    - stress tests
+
+- Optional ML tuner (after stability):
+  - tuning/weight_optimizer.py
+  - ML proposes:
+    - weight sets
+    - threshold sets
+    - sizing curves
+  - Constraints:
+    - preserve causal signs
+    - preserve monotonicity
+
+Failure-aware notes:
+- ML is a tuner, not a decision-maker.
+- Only use ML after manual stability is achieved.
+
+----------------------------------------------------------------------
+8. PHASE 7 — FREEZE TRADING STOCKFISH v1.0
+----------------------------------------------------------------------
+
+Goal:
+Declare a real, official v1.0 instead of chasing endless perfection.
+
+v1.0 Criteria:
+- Causally clean (bias tests passing)
+- Execution-honest (ExecutionSimulator required)
+- Risk-governed (PolicyEngine + PortfolioRiskManager + Governance)
+- Self-aware (EngineHealthMonitor active)
+- Explainable (eval + policy reasoning)
+- Scientifically benchmarked (multi-year, multi-symbol, regime-segmented)
+
+Documentation:
+- OFFICIAL_ENGINE_SPEC.md
+- TRADING_STOCKFISH_V1_RELEASE_NOTES.md
+
+----------------------------------------------------------------------
+9. HOW TO USE THIS FILE
+----------------------------------------------------------------------
+
+After each major coding session:
+1. Return to this file.
+2. Identify the current phase.
+3. Mark completed tasks.
+4. Update CURRENT_ENGINE_FAILURE_MODES.md if needed.
+5. Move to the next task in sequence.
+
+This roadmap ensures:
+- fastest path to success,
+- minimal wasted effort,
+- avoidance of major pitfalls,
+- and a clear route to Trading Stockfish v1.0.
+
+======================================================================
+END OF FILE
+======================================================================

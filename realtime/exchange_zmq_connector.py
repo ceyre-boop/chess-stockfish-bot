@@ -99,6 +99,8 @@ class ZeroMQConnector(BaseConnector):
         self.reader_thread = None
         self.reorder_thread = None
         self.running = False
+        # Per-symbol last timestamp (float seconds) to enforce monotonicity
+        self._last_tick_ts: Dict[str, float] = {}
         
         logger.info(f"Initialized ZMQ connector ({endpoints}, {feed_type.value})")
     
@@ -292,14 +294,12 @@ class ZeroMQConnector(BaseConnector):
         """Normalize ZMQ message to MarketUpdate."""
         try:
             data = msg.get('data', {})
-            timestamp = msg.get('timestamp')
-            if timestamp and isinstance(timestamp, str):
-                try:
-                    timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                except:
-                    timestamp = datetime.now(timezone.utc)
-            else:
-                timestamp = datetime.now(timezone.utc)
+            raw_ts = msg.get('timestamp')
+            timestamp = self._parse_timestamp(raw_ts)
+            if timestamp is None:
+                logger.warning(f"ZMQ: Invalid/missing timestamp for {symbol}; dropping message")
+                self.stats['data_errors'] += 1
+                return
             
             if msg_type == 'ticker':
                 update = self._normalize_ticker(symbol, data, timestamp)
@@ -325,23 +325,31 @@ class ZeroMQConnector(BaseConnector):
     def _normalize_ticker(self, symbol: str, data: Dict, timestamp: datetime) -> Optional[MarketUpdate]:
         """Normalize ticker message."""
         try:
-            tick = PriceTick(
-                symbol=symbol,
-                bid=float(data.get('bid', 0)),
-                ask=float(data.get('ask', 0)),
-                last=float(data.get('last', 0)),
-                bid_volume=float(data.get('bid_volume', 0)),
-                ask_volume=float(data.get('ask_volume', 0)),
-                last_volume=float(data.get('volume', 0)),
-                timestamp=timestamp,
-                exchange='ZMQ'
-            )
-            
+            # Convert timestamp to float seconds
+            ts = self._dt_to_seconds(timestamp)
+            # Monotonicity check
+            last_ts = self._last_tick_ts.get(symbol)
+            if last_ts is not None and ts <= last_ts:
+                logger.warning(f"ZMQ: Tick timestamp not monotonic for {symbol}: {ts} <= {last_ts}; dropping")
+                return None
+            self._last_tick_ts[symbol] = ts
+
+            canonical = {
+                "symbol": symbol,
+                "timestamp": float(ts),
+                "bid": float(data.get('bid', 0.0)),
+                "ask": float(data.get('ask', 0.0)),
+                "last": float(data.get('last', 0.0)),
+                "volume": float(data.get('volume', 0.0)),
+                "source": "zmq",
+            }
+
             return MarketUpdate(
                 data_type=DataType.PRICE_TICK,
-                payload=tick,
-                timestamp=timestamp,
-                sequence_number=self.stats['updates_normalized']
+                payload=canonical,
+                timestamp=datetime.fromtimestamp(ts, timezone.utc),
+                sequence_number=self.stats.get('updates_normalized', 0),
+                source='zmq'
             )
         except Exception as e:
             logger.error(f"ZMQ: Ticker normalization error: {str(e)}")
@@ -363,12 +371,22 @@ class ZeroMQConnector(BaseConnector):
                 timestamp=timestamp,
                 exchange='ZMQ'
             )
-            
+            # For engine-facing flows we still send orderbook snapshots, but
+            # convert payload to dicts and ensure timestamp normalization.
+            ts = self._dt_to_seconds(timestamp)
+            payload = snapshot.to_dict()
+            # Convert payload timestamp to float seconds
+            try:
+                payload['timestamp'] = float(ts)
+            except Exception:
+                payload['timestamp'] = ts
+
             return MarketUpdate(
                 data_type=DataType.ORDERBOOK_SNAPSHOT,
-                payload=snapshot,
-                timestamp=timestamp,
-                sequence_number=self.stats['updates_normalized']
+                payload=payload,
+                timestamp=datetime.fromtimestamp(ts, timezone.utc),
+                sequence_number=self.stats.get('updates_normalized', 0),
+                source='zmq'
             )
         except Exception as e:
             logger.error(f"ZMQ: Depth normalization error: {str(e)}")
@@ -381,26 +399,64 @@ class ZeroMQConnector(BaseConnector):
             price = float(data.get('price', 0))
             volume = float(data.get('quantity', 0))
             side = data.get('side', 'unknown')
-            
-            tick = PriceTick(
-                symbol=symbol,
-                bid=price,
-                ask=price,
-                last=price,
-                last_volume=volume,
-                timestamp=timestamp,
-                exchange='ZMQ'
-            )
-            
+            ts = self._dt_to_seconds(timestamp)
+            last_ts = self._last_tick_ts.get(symbol)
+            if last_ts is not None and ts <= last_ts:
+                logger.warning(f"ZMQ: Trade timestamp not monotonic for {symbol}: {ts} <= {last_ts}; dropping")
+                return None
+            self._last_tick_ts[symbol] = ts
+
+            canonical = {
+                "symbol": symbol,
+                "timestamp": float(ts),
+                "bid": float(price),
+                "ask": float(price),
+                "last": float(price),
+                "volume": float(volume),
+                "source": "zmq",
+            }
+
             return MarketUpdate(
                 data_type=DataType.PRICE_TICK,
-                payload=tick,
-                timestamp=timestamp,
-                sequence_number=self.stats['updates_normalized']
+                payload=canonical,
+                timestamp=datetime.fromtimestamp(ts, timezone.utc),
+                sequence_number=self.stats.get('updates_normalized', 0),
+                source='zmq'
             )
         except Exception as e:
             logger.error(f"ZMQ: Trade normalization error: {str(e)}")
             return None
+
+    def _parse_timestamp(self, raw_ts: Any) -> Optional[datetime]:
+        """Parse various timestamp formats into a timezone-aware datetime UTC.
+
+        Accepts ISO strings, integer/float milliseconds or seconds. Returns None
+        on failure.
+        """
+        try:
+            if raw_ts is None:
+                return None
+            # ISO string
+            if isinstance(raw_ts, str):
+                try:
+                    return datetime.fromisoformat(raw_ts.replace('Z', '+00:00'))
+                except Exception:
+                    return None
+            # Numeric
+            if isinstance(raw_ts, (int, float)):
+                # Heuristic: if > 1e12 -> ms, >1e9 -> s
+                if raw_ts > 1e12:
+                    return datetime.fromtimestamp(float(raw_ts) / 1000.0, timezone.utc)
+                else:
+                    return datetime.fromtimestamp(float(raw_ts), timezone.utc)
+        except Exception:
+            return None
+
+    def _dt_to_seconds(self, dt: datetime) -> float:
+        try:
+            return float(dt.timestamp())
+        except Exception:
+            return float(time.time())
     
     # ============================================================================
     # Subscription Methods

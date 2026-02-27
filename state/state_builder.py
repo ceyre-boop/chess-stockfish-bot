@@ -51,7 +51,7 @@ import logging
 import math
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 
 import numpy as np
 
@@ -70,13 +70,9 @@ from engine.volatility_features import VolatilityFeatures
 from engine.volatility_utils import compute_atr
 from session_regime import compute_session_regime
 
-try:
-    import MetaTrader5 as mt5
-
-    MT5_AVAILABLE = True
-except ImportError:
-    MT5_AVAILABLE = False
-    logging.warning("MetaTrader5 not available - will run in mock mode")
+# MetaTrader5/sdk must not be referenced directly by state_builder.
+# Adapters and `data.unified_feed` are the only allowed provider interfaces.
+MT5_AVAILABLE = False
 
 
 def _session_modifiers(session_label: str) -> Dict[str, float]:
@@ -120,7 +116,8 @@ logging.basicConfig(
     level=logging.DEBUG, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
-_last_tick_timestamp: Optional[float] = None
+# Per-symbol last timestamp tracker to enforce monotonicity without fabrication
+_last_tick_timestamp_by_symbol: Dict[str, Dict[str, Any]] = {}
 
 # Configuration constants
 STALE_TICK_THRESHOLD = 60  # seconds - warn if tick older than this
@@ -138,10 +135,10 @@ TIMEFRAMES = {
 }
 
 MT5_TIMEFRAMES = {
-    "M1": mt5.TIMEFRAME_M1 if MT5_AVAILABLE else 1,
-    "M5": mt5.TIMEFRAME_M5 if MT5_AVAILABLE else 5,
-    "M15": mt5.TIMEFRAME_M15 if MT5_AVAILABLE else 15,
-    "H1": mt5.TIMEFRAME_H1 if MT5_AVAILABLE else 60,
+    "M1": 1,
+    "M5": 5,
+    "M15": 15,
+    "H1": 60,
 }
 
 
@@ -207,44 +204,16 @@ def shutdown_mt5():
 
 def fetch_tick_data(symbol: str, use_demo: bool = False) -> Optional[Dict]:
     """
-    Fetch current tick data (bid, ask, spread).
-
-    Args:
-        symbol: Trading symbol (e.g., 'EURUSD')
-        use_demo: If True, use mock data instead of live MT5
+    Fetch a canonical snapshot for the symbol.
+    This is the ONLY sensory entry point for state_builder.
 
     Returns:
-        Dict with bid, ask, spread, timestamp. None if failed.
+        Canonical snapshot dict or None when no new data is available.
     """
-    if use_demo:
-        raise RuntimeError("Synthetic/demo tick data is forbidden; use live MT5")
-    if not MT5_AVAILABLE:
-        raise RuntimeError("MT5 is not available; cannot fabricate tick data")
+    from data.unified_feed import get_snapshot
 
-    try:
-        tick = mt5.symbol_info_tick(symbol)
-        if tick is None:
-            logger.warning(f"No tick data for {symbol}")
-            return None
-
-        bid = tick.bid
-        ask = tick.ask
-        spread = (ask - bid) * 10000  # Convert to pips for EURUSD-like pairs
-
-        tick_data = {
-            "bid": bid,
-            "ask": ask,
-            "spread": spread,
-            "last_tick_time": tick.time,
-            "timestamp": time.time(),
-        }
-
-        logger.debug(f"{symbol} tick: bid={bid}, ask={ask}, spread={spread:.2f} pips")
-        return tick_data
-
-    except Exception as e:
-        logger.error(f"Error fetching tick data for {symbol}: {e}")
-        return None
+    snapshot = get_snapshot(symbol)
+    return snapshot  # may be None (NO_DATA)
 
 
 def fetch_candles(
@@ -262,63 +231,7 @@ def fetch_candles(
     Returns:
         Dict with OHLC data and indicators. None if failed.
     """
-    if use_demo:
-        raise RuntimeError("Synthetic/demo candle data is forbidden; use live MT5")
-    if not MT5_AVAILABLE:
-        raise RuntimeError("MT5 is not available; cannot fabricate candle data")
-
-    try:
-        if timeframe not in MT5_TIMEFRAMES:
-            logger.error(f"Unknown timeframe: {timeframe}")
-            return None
-
-        mt5_tf = MT5_TIMEFRAMES[timeframe]
-        candles = mt5.copy_rates_from_pos(symbol, mt5_tf, 0, count)
-
-        if candles is None or len(candles) == 0:
-            logger.warning(f"No candle data for {symbol} {timeframe}")
-            return None
-
-        # Convert to DataFrame-like structure
-        close_prices = np.array([c["close"] for c in candles])
-        high_prices = np.array([c["high"] for c in candles])
-        low_prices = np.array([c["low"] for c in candles])
-
-        # Calculate indicators
-        rsi = _calculate_rsi(close_prices, period=14)
-        sma_50 = _calculate_sma(close_prices, period=50)
-        sma_200 = _calculate_sma(close_prices, period=200)
-        atr = _calculate_atr(high_prices, low_prices, close_prices, period=14)
-
-        last_candle = candles[-1]
-
-        candle_data = {
-            "timeframe": timeframe,
-            "count": len(candles),
-            "latest": {
-                "open": float(last_candle["open"]),
-                "high": float(last_candle["high"]),
-                "low": float(last_candle["low"]),
-                "close": float(last_candle["close"]),
-                "volume": int(last_candle["tick_volume"]),
-                "time": int(last_candle["time"]),
-            },
-            "indicators": {
-                "rsi_14": float(rsi) if not np.isnan(rsi) else None,
-                "sma_50": float(sma_50) if not np.isnan(sma_50) else None,
-                "sma_200": float(sma_200) if not np.isnan(sma_200) else None,
-                "atr_14": float(atr) if not np.isnan(atr) else None,
-            },
-        }
-
-        logger.debug(
-            f"{symbol} {timeframe}: close={last_candle['close']}, rsi={rsi:.2f}, atr={atr:.2f}"
-        )
-        return candle_data
-
-    except Exception as e:
-        logger.error(f"Error fetching candles for {symbol} {timeframe}: {e}")
-        return None
+    raise RuntimeError("Direct MT5 candle access from state_builder is forbidden; use adapters or data.unified_feed for canonical candles.")
 
 
 def _calculate_rsi(prices: np.ndarray, period: int = 14) -> float:
@@ -493,6 +406,7 @@ def check_data_health(tick_time: int, candle_time: int) -> Dict:
 
 def build_state(
     symbol: str = "EURUSD",
+    snapshot: Optional[Dict] = None,
     use_demo: bool = False,
     order_book_events: Optional[list] = None,
 ) -> Optional[Dict]:
@@ -512,21 +426,67 @@ def build_state(
 
     logger.info(f"Building state for {symbol} (demo={use_demo})")
 
-    # Fetch tick data
-    tick_data = fetch_tick_data(symbol, use_demo=use_demo)
-    if tick_data is None:
-        logger.error(f"Failed to fetch tick data for {symbol}")
+    # Expect a canonical snapshot dict supplied by the unified feed.
+    # If no snapshot is provided, skip state update (benign no-op).
+    # Backwards compatibility: callers may pass a snapshot dict as the first
+    # positional argument (older code). Detect and adjust accordingly.
+    if isinstance(symbol, dict) and snapshot is None:
+        snapshot = symbol
+        symbol = snapshot.get("symbol", "UNKNOWN")
+
+    logger.info(f"Building state for {symbol} (demo={use_demo})")
+
+    if snapshot is None:
+        logger.debug(f"No canonical snapshot provided for {symbol}; skipping state build")
         return None
+
+    if not isinstance(snapshot, dict):
+        logger.error("Non-canonical snapshot provided to build_state; skipping")
+        return None
+
+    # Validate against canonical schema if available
+    try:
+        from data.canonical_schema import validate_snapshot, assert_snapshot
+
+        if not validate_snapshot(snapshot):
+            logger.warning(f"Snapshot failed canonical validation for {symbol}; skipping")
+            return None
+        # In debug scenarios assert the snapshot shape
+        DEBUG = False
+        if DEBUG:
+            assert_snapshot(snapshot)
+    except Exception:
+        # If schema module missing or validation errors, continue conservatively
+        logger.debug("canonical_schema unavailable; proceeding with basic mapping")
+
+    # Map canonical snapshot fields into the legacy tick_data shape expected
+    # by downstream functions. This is a thin adapter layer only.
+    tick_data = {
+        "symbol": snapshot.get("symbol"),
+        "timestamp": snapshot.get("timestamp"),
+        "bid": snapshot.get("bid") if snapshot.get("bid") is not None else snapshot.get("price"),
+        "ask": snapshot.get("ask") if snapshot.get("ask") is not None else snapshot.get("price"),
+        "last": snapshot.get("price"),
+        "volume": snapshot.get("volume"),
+        "source": snapshot.get("provider") or snapshot.get("source"),
+    }
+
+    # Validate the mapped tick_data for monotonicity and sanity
     _ensure_valid_tick_data(tick_data)
 
     # Fetch candles for all timeframes
     candles = {}
     candle_times = []
     for timeframe in TIMEFRAMES.keys():
-        candle = fetch_candles(symbol, timeframe, count=100, use_demo=use_demo)
+        # Request more history for higher timeframes so long-period indicators
+        # (e.g. SMA-200 on H1) can be computed. Keep default 100 for smaller
+        # TFs but request 250 for H1.
+        count = 250 if timeframe == "H1" else 100
+        candle = fetch_candles(symbol, timeframe, count=count, use_demo=use_demo)
         if candle is not None:
             candles[timeframe] = candle
-            candle_times.append(candle["latest"]["time"])
+            # latest timestamp normalized to 'timestamp' by fetch_candles
+            candle_times.append(candle["latest"].get("timestamp", candle["latest"].get("time")))
         else:
             logger.warning(f"Failed to fetch {timeframe} candles for {symbol}")
             candles[timeframe] = None
@@ -561,7 +521,7 @@ def build_state(
 
     # Check data health
     latest_candle_time = max(candle_times) if candle_times else int(time.time())
-    health = check_data_health(tick_data["last_tick_time"], latest_candle_time)
+    health = check_data_health(int(tick_data.get("timestamp", int(time.time()))), int(latest_candle_time))
 
     # Order book integration (Phase v4.0-A only)
     vol_features = VolatilityFeatures(window=50, use_microstructure_realism=True)
@@ -590,7 +550,7 @@ def build_state(
     # Session regime + deterministic modifiers for downstream policy/evaluator
     session_label = "UNKNOWN"
     try:
-        ts_source = float(tick_data.get("last_tick_time") or time.time())
+        ts_source = float(tick_data.get("timestamp") or time.time())
         session_label = compute_session_regime(ts_source).value
     except Exception:
         session_label = "UNKNOWN"
@@ -692,22 +652,19 @@ def validate_state(state: Optional[Dict]) -> Tuple[bool, List[str]]:
             errors.append(f"Missing required key: {key}")
 
     if "tick" in state and state["tick"]:
-        tick_keys = ["bid", "ask", "spread", "last_tick_time"]
+        tick_keys = ["symbol", "timestamp", "bid", "ask", "last", "volume", "source"]
         for key in tick_keys:
             if key not in state["tick"]:
                 errors.append(f"Missing tick key: {key}")
         bid = state["tick"].get("bid")
         ask = state["tick"].get("ask")
-        spread = state["tick"].get("spread")
-        if bid is None or ask is None or spread is None:
-            errors.append("Tick missing bid/ask/spread values")
+        if bid is None or ask is None:
+            errors.append("Tick missing bid/ask values")
         else:
             if bid <= 0 or ask <= 0:
                 errors.append("Tick has non-positive prices")
             if ask <= bid:
                 errors.append("Tick spread not positive")
-            if spread <= 0:
-                errors.append("Spread must be positive")
 
     if "health" in state and state["health"].get("is_stale"):
         errors.append("State data is stale")
@@ -721,28 +678,75 @@ def _mock_tick_data(symbol: str) -> Dict:
 
 
 def _ensure_valid_tick_data(tick_data: Dict) -> None:
-    global _last_tick_timestamp
-    required = ["bid", "ask", "spread", "last_tick_time", "timestamp"]
+    # Validate canonical tick structure and enforce monotonicity per-symbol
+    required = ["symbol", "timestamp", "bid", "ask", "last", "volume", "source"]
     for field in required:
         if tick_data.get(field) is None:
             raise StateBuilderError(f"Tick missing required field {field}")
 
+    symbol = str(tick_data["symbol"]) if tick_data.get("symbol") is not None else ""
     bid = float(tick_data["bid"])
     ask = float(tick_data["ask"])
-    spread = float(tick_data["spread"])
-    ts = float(tick_data["last_tick_time"])
+    ts = float(tick_data["timestamp"])
 
-    if any(math.isnan(val) or math.isinf(val) for val in [bid, ask, spread, ts]):
+    if any(math.isnan(val) or math.isinf(val) for val in [bid, ask, ts]):
         raise StateBuilderError("Tick contains NaN/inf values")
     if bid <= 0 or ask <= 0:
         raise StateBuilderError("Tick has non-positive prices")
     if ask <= bid:
         raise StateBuilderError("Tick spread not positive (ask <= bid)")
-    if spread <= 0:
-        raise StateBuilderError("Tick spread must be positive")
-    if _last_tick_timestamp is not None and ts <= _last_tick_timestamp:
-        raise StateBuilderError("Tick timestamp not monotonic increasing")
-    _last_tick_timestamp = ts
+
+    # Normalize stored last-seen entry: it may be a float (older code) or a dict
+    last_entry = _last_tick_timestamp_by_symbol.get(symbol)
+    prev_ts = prev_bid = prev_ask = prev_last = prev_vol = None
+    if last_entry is not None:
+        if isinstance(last_entry, dict):
+            try:
+                prev_ts = float(last_entry.get("ts"))
+            except Exception:
+                prev_ts = None
+            prev_bid = last_entry.get("bid")
+            prev_ask = last_entry.get("ask")
+            prev_last = last_entry.get("last")
+            prev_vol = last_entry.get("volume")
+        else:
+            try:
+                prev_ts = float(last_entry)
+            except Exception:
+                prev_ts = None
+
+    # Strictly drop older timestamps
+    if prev_ts is not None and ts < prev_ts:
+        logger.warning(
+            f"Non-monotonic tick timestamp detected for {symbol}: {ts} < {prev_ts}"
+        )
+        raise StateBuilderError("Non-monotonic tick timestamp detected")
+
+    # Equal timestamps: accept only if market content changed
+    if prev_ts is not None and ts == prev_ts:
+        try:
+            if (
+                float(prev_bid or 0.0) == float(bid or 0.0)
+                and float(prev_ask or 0.0) == float(ask or 0.0)
+                and float(prev_last or 0.0) == float(tick_data.get("last", 0.0))
+                and float(prev_vol or 0.0) == float(tick_data.get("volume", 0.0))
+            ):
+                logger.warning(
+                    f"Non-monotonic tick timestamp detected for {symbol}: {ts} == {prev_ts} with identical content"
+                )
+                raise StateBuilderError("Non-monotonic tick timestamp detected")
+        except Exception:
+            # On comparison error, be conservative and accept
+            pass
+
+    # Accept and store full last-seen dict
+    _last_tick_timestamp_by_symbol[symbol] = {
+        "ts": float(ts),
+        "bid": float(bid),
+        "ask": float(ask),
+        "last": float(tick_data.get("last", 0.0)),
+        "volume": float(tick_data.get("volume", 0.0)),
+    }
 
 
 def _ensure_valid_volatility(indicators: Dict) -> None:

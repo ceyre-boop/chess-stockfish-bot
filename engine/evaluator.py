@@ -34,11 +34,8 @@ import pandas as pd
 
 from . import test_flags
 from .abs_balance_controller import BALANCE_CONTROLLER
-from .canonical_validator import (
-    assert_causal_required,
-    assert_ml_advisory_only,
-    canonical_enforced,
-)
+from .canonical_validator import (assert_causal_required,
+                                  assert_ml_advisory_only, canonical_enforced)
 from .condition_encoder import encode_conditions
 from .decision_frame import DecisionFrame
 from .decision_logger import DecisionLogger
@@ -48,17 +45,12 @@ from .market_profile_features import MarketProfileFeatures
 from .market_profile_model import TrainedMarketProfileModel
 from .market_profile_state_machine import MarketProfileStateMachine
 from .ml_aux_signals import compute_ml_hints
-
 # Regime engine helpers
 from .regime_engine import compute_regime_bundle
-from .structure_brain import (
-    MarketProfileFrame,
-    SessionProfileFrame,
-    classify_market_profile,
-    classify_session_profile,
-    compute_liquidity_frame,
-)
-
+from .structure_brain import (MarketProfileFrame, SessionProfileFrame,
+                              classify_market_profile,
+                              classify_session_profile,
+                              compute_liquidity_frame)
 # Minimal core types (placeholder scaffolding)
 from .types import EvaluationOutput, MarketState
 
@@ -765,10 +757,8 @@ def _build_decision_frame(
 
 # Integration imports (for causal + policy pipeline)
 try:
-    from engine.integration import (
-        create_integrated_evaluator_factory,
-        evaluate_and_decide,
-    )
+    from engine.integration import (create_integrated_evaluator_factory,
+                                    evaluate_and_decide)
 
     INTEGRATION_AVAILABLE = True
 except ImportError:
@@ -2291,7 +2281,8 @@ def create_evaluator_factory(
 
                 # Use defaults if not provided
                 if position_state is None:
-                    from engine.policy_engine import PositionSide, PositionState
+                    from engine.policy_engine import (PositionSide,
+                                                      PositionState)
 
                     position_state = PositionState(side=PositionSide.FLAT, size=0.0)
 

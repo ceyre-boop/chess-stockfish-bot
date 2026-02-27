@@ -13,7 +13,9 @@ from typing import Dict, Generator, List, Optional
 
 import requests
 
-from config.env_loader import load_env
+
+from dotenv import load_dotenv
+import os
 
 BASE_URL = "https://api.polygon.io"
 DEFAULT_TIMEOUT = 10
@@ -29,7 +31,8 @@ class PolygonAPIError(Exception):
 
 
 def _api_key() -> str:
-    key = load_env().get("POLYGON_API_KEY")
+    load_dotenv()
+    key = os.getenv("POLYGON_API_KEY")
     if not key:
         raise PolygonAPIError("POLYGON_API_KEY not set in environment or .env")
     return key
@@ -42,6 +45,8 @@ def _request_json(url: str, params: Optional[Dict[str, str]] = None) -> Dict:
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             resp = requests.get(url, params=params, timeout=DEFAULT_TIMEOUT)
+            if resp.status_code == 403:
+                raise PolygonAPIError("403 Forbidden: Check your API key and permissions.")
             if resp.status_code == 429:
                 time.sleep(min(2 * attempt, 5))
                 continue
@@ -54,24 +59,25 @@ def _request_json(url: str, params: Optional[Dict[str, str]] = None) -> Dict:
 
 
 def _canonical_tick_from_bar(bar: Dict, symbol: str) -> Dict[str, float]:
-    ts_raw = bar.get("t") or bar.get("timestamp")
-    bid = bar.get("bid")
-    ask = bar.get("ask")
-    volume = bar.get("v") or bar.get("volume")
-    if ts_raw is None or bid is None or ask is None or volume is None:
-        raise PolygonAPIError("Malformed bar: missing bid/ask/timestamp/volume")
-    ts_val = float(ts_raw)
-    ts = ts_val / 1000.0 if ts_val > 1e12 else ts_val
-    mid = (float(bid) + float(ask)) / 2.0
+    # v3 aggregate schema: t (timestamp), o (open), h (high), l (low), c (close), v (volume), vw (vwap)
+    ts_raw = bar.get("t")
+    open_ = bar.get("o")
+    high = bar.get("h")
+    low = bar.get("l")
+    close = bar.get("c")
+    volume = bar.get("v")
+    vwap = bar.get("vw")
+    if ts_raw is None or open_ is None or high is None or low is None or close is None or volume is None:
+        raise PolygonAPIError("Malformed bar: missing o/h/l/c/v/t fields")
+    ts = float(ts_raw)
     return {
         "timestamp": ts,
-        "bid": float(bid),
-        "ask": float(ask),
-        "mid": mid,
-        "price": mid,
+        "open": float(open_),
+        "high": float(high),
+        "low": float(low),
+        "close": float(close),
+        "vwap": float(vwap) if vwap is not None else None,
         "volume": float(volume),
-        "buy_volume": float(volume) / 2.0,
-        "sell_volume": float(volume) / 2.0,
         "symbol": symbol,
         "raw": bar,
     }
@@ -84,22 +90,64 @@ def get_historical_bars(symbol: str, date: str, timespan: str = "minute") -> Lis
     timespan: e.g., "minute", "second"
     """
     url = f"{BASE_URL}/v2/aggs/ticker/{symbol}/range/1/{timespan}/{date}/{date}"
-    data = _request_json(
-        url, params={"adjusted": "true", "sort": "asc", "limit": 50000}
-    )
+    params = {"sort": "asc", "limit": 50000, "adjusted": "true"}
+    data = _request_json(url, params=params)
     results = data.get("results") or []
     ticks: List[Dict] = []
     last_ts: Optional[float] = None
     for bar in results:
         try:
             candidate = _canonical_tick_from_bar(bar, symbol)
-            if _validate_tick(candidate, last_ts):
+            # NBBO quote for this bar
+            quote = get_nbbo_quotes(symbol, candidate["timestamp"])
+            if quote:
+                candidate["bid"] = quote["bid"]
+                candidate["ask"] = quote["ask"]
+            else:
+                logger.warning(f"No NBBO quote for {symbol} at {candidate['timestamp']}")
+            if _validate_bar(candidate, last_ts):
                 last_ts = candidate["timestamp"]
                 ticks.append(candidate)
         except PolygonAPIError as exc:
             logger.critical(f"Skipping malformed bar: {exc}")
             continue
     return ticks
+
+# New: Get NBBO quote for a symbol at a given timestamp
+def get_nbbo_quotes(symbol: str, timestamp: float) -> Optional[Dict]:
+    # Polygon v3 quotes endpoint (latest NBBO for symbol)
+    url = f"{BASE_URL}/v3/quotes/{symbol}"
+    params = {"limit": 1, "timestamp": int(timestamp), "sort": "asc"}
+    try:
+        data = _request_json(url, params=params)
+        results = data.get("results") or []
+        if not results:
+            return None
+        quote = results[0]
+        bid = quote.get("bidPrice")
+        ask = quote.get("askPrice")
+        ts = quote.get("t")
+        if bid is None or ask is None or ts is None:
+            return None
+        return {"bid": float(bid), "ask": float(ask), "timestamp": float(ts)}
+    except Exception as e:
+        logger.warning(f"Failed to fetch NBBO quote: {e}")
+        return None
+
+# New: Validate bar with new schema
+def _validate_bar(bar: Dict, last_ts: Optional[float]) -> bool:
+    required = ["timestamp", "open", "high", "low", "close", "volume", "bid", "ask"]
+    for field in required:
+        if field not in bar or bar[field] is None:
+            logger.warning(f"Bar missing required field {field}; skipping")
+            return False
+    if bar["bid"] <= 0 or bar["ask"] <= 0 or bar["ask"] <= bar["bid"]:
+        logger.warning(f"Invalid bid/ask: {bar}")
+        return False
+    if last_ts is not None and bar["timestamp"] <= last_ts:
+        logger.warning("Bar timestamp is not strictly increasing; skipping")
+        return False
+    return True
 
 
 def _canonical_tick_from_quote(payload: Dict, symbol: str) -> Optional[Dict]:

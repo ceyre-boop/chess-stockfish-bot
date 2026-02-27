@@ -1,0 +1,347 @@
+{
+  "SENSORY_ENTRY_POINTS": [
+    {
+      "module": "adapters.mt5_adapter",
+      "object": "init_mt5_from_env",
+      "type": "function",
+      "role": "mt5_initialization",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Initializes MT5 connection from env; adapter-level init helper."
+    },
+    {
+      "module": "adapters.mt5_adapter",
+      "object": "get_historical_bars_mt5",
+      "type": "function",
+      "role": "historical_bars_mt5",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Fetches MT5 historical bars and converts to primitive canonical dicts."
+    },
+    {
+      "module": "adapters.mt5_adapter",
+      "object": "get_latest_tick",
+      "type": "function",
+      "role": "latest_tick",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Returns a canonical tick dict by wrapping MetaTrader5.symbol_info_tick."
+    },
+    {
+      "module": "adapters.alpaca_adapter",
+      "object": "get_historical_bars",
+      "type": "function",
+      "role": "historical_bars_alpaca",
+      "provider": "alpaca",
+      "classification": "KEEP",
+      "notes": "Calls Alpaca HTTP API, normalizes bars to canonical dicts."
+    },
+    {
+      "module": "adapters.polygon_adapter",
+      "object": "get_historical_bars",
+      "type": "function",
+      "role": "historical_bars_polygon",
+      "provider": "polygon",
+      "classification": "KEEP",
+      "notes": "Fetches Polygon aggregates and normalizes into canonical bars."
+    },
+    {
+      "module": "adapters.polygon_adapter",
+      "object": "stream_live",
+      "type": "function",
+      "role": "polygon_live_stream",
+      "provider": "polygon",
+      "classification": "KEEP",
+      "notes": "REST-polling live stream (NBBO) producing canonical tick-like dicts."
+    },
+    {
+      "module": "adapters.polygon_adapter",
+      "object": "get_nbbo_quotes",
+      "type": "function",
+      "role": "nbbo_quote_lookup",
+      "provider": "polygon",
+      "classification": "KEEP",
+      "notes": "Helper that fetches NBBO quote(s) for historical normalization."
+    },
+    {
+      "module": "adapters.market_data_router",
+      "object": "get_unified_bars",
+      "type": "function",
+      "role": "router_dual_feed",
+      "provider": "mixed",
+      "classification": "KEEP",
+      "notes": "Router: prefer Polygon, fallback to Alpaca; returns validated bars."
+    },
+    {
+      "module": "adapters.market_data_router",
+      "object": "get_historical_bars_dual_feed",
+      "type": "function",
+      "role": "alias_dual_feed",
+      "provider": "mixed",
+      "classification": "KEEP",
+      "notes": "Alias for get_unified_bars for dual-feed usage."
+    },
+    {
+      "module": "adapters.asset_class_router",
+      "object": "get_historical_bars_asset_routed",
+      "type": "function",
+      "role": "asset_routing",
+      "provider": "mixed",
+      "classification": "KEEP",
+      "notes": "Routes asset classes to Polygon/Alpaca or MT5 historical adapters."
+    },
+    {
+      "module": "data.unified_feed",
+      "object": "UnifiedFeed.load_historical",
+      "type": "function",
+      "role": "unified_historical_loader",
+      "provider": "mixed",
+      "classification": "KEEP",
+      "notes": "Unified loader for historical ticks/bars; supports polygon, mt5, scenario."
+    },
+    {
+      "module": "data.unified_feed",
+      "object": "UnifiedFeed.stream",
+      "type": "function",
+      "role": "unified_live_stream",
+      "provider": "mixed",
+      "classification": "KEEP",
+      "notes": "Unified live stream generator that canonicalizes and enforces monotonicity."
+    },
+    {
+      "module": "data.polygon_adapter",
+      "object": "stream_live",
+      "type": "function",
+      "role": "polygon_live_stream_alternate",
+      "provider": "polygon",
+      "classification": "WRAP",
+      "notes": "Alternate polygon adapter implementation under data/; duplicates live ingestion."
+    },
+    {
+      "module": "data.mt5_adapter",
+      "object": "stream_live",
+      "type": "function",
+      "role": "mt5_live_stream_alternate",
+      "provider": "mt5",
+      "classification": "WRAP",
+      "notes": "Alternate MT5 adapter (data/) with streaming generator; duplicate of adapters/ layer."
+    },
+    {
+      "module": "mt5.live_feed",
+      "object": "MT5LiveFeed.get_tick",
+      "type": "function",
+      "role": "engine_feed_get_tick",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Engine-facing MT5 feed; returns canonical primitive tick dicts."
+    },
+    {
+      "module": "mt5.live_feed",
+      "object": "MT5LiveFeed.get_candles",
+      "type": "function",
+      "role": "engine_feed_get_candles",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Engine-facing candles reader; wraps MT5 candle APIs and normalizes output."
+    },
+    {
+      "module": "mt5.live_feed",
+      "object": "initialize_feed",
+      "type": "function",
+      "role": "engine_feed_singleton_init",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Helper that constructs a global MT5LiveFeed instance for engine use."
+    },
+    {
+      "module": "mt5.live_feed",
+      "object": "get_feed",
+      "type": "function",
+      "role": "engine_feed_singleton_get",
+      "provider": "mt5",
+      "classification": "KEEP",
+      "notes": "Returns or initializes the global MT5LiveFeed instance."
+    },
+    {
+      "module": "loop.realtime",
+      "object": "_fetch_market_data",
+      "type": "function",
+      "role": "engine_loop_data_pull",
+      "provider": "mixed",
+      "classification": "WRAP",
+      "notes": "Engine loop helper that pulls ticks via configured feed; treats adapter None specially."
+    },
+    {
+      "module": "loop.realtime",
+      "object": "run_iteration",
+      "type": "function",
+      "role": "engine_loop_iteration",
+      "provider": "mixed",
+      "classification": "WRAP",
+      "notes": "Main realtime iteration that invokes feed get_tick and state builder."
+    },
+    {
+      "module": "state.state_builder",
+      "object": "fetch_tick_data",
+      "type": "function",
+      "role": "state_builder_tick_fetch",
+      "provider": "mt5",
+      "classification": "WRAP",
+      "notes": "Delegates tick fetch to adapters.mt5_adapter.get_latest_tick or unified_feed fallback."
+    },
+    {
+      "module": "state.state_builder",
+      "object": "fetch_candles",
+      "type": "function",
+      "role": "state_builder_candles",
+      "provider": "mt5",
+      "classification": "WRAP",
+      "notes": "Currently calls MT5 candle APIs (mt5.copy_rates_from_pos); should be routed via adapters."
+    },
+    {
+      "module": "state.state_builder",
+      "object": "_mock_tick_data",
+      "type": "function",
+      "role": "disabled_mock_provider",
+      "provider": "replay",
+      "classification": "KILL",
+      "notes": "Mock tick generator explicitly disabled (raises RuntimeError); legacy mock path."
+    },
+    {
+      "module": "mt5.orders",
+      "object": "MockTickData",
+      "type": "class",
+      "role": "mock_tick_dataclass",
+      "provider": "replay",
+      "classification": "WRAP",
+      "notes": "Dataclass used to create mock ticks; used by MT5 orders mock paths (returns canonical via to_canonical())."
+    },
+    {
+      "module": "mt5.orders",
+      "object": "MT5Orders._mock_tick",
+      "type": "function",
+      "role": "orders_mock_tick",
+      "provider": "replay",
+      "classification": "WRAP",
+      "notes": "Orders module fallback that returns a primitive canonical mock tick for demo/testing."
+    },
+    {
+      "module": "legacy.mt5_live_feed_mock",
+      "object": "mock_tick",
+      "type": "function",
+      "role": "legacy_mock_tick",
+      "provider": "replay",
+      "classification": "KILL",
+      "notes": "Legacy test-only mock generator moved to legacy/; must not be imported by runtime."
+    },
+    {
+      "module": "legacy.mt5_live_feed_mock",
+      "object": "mock_candles",
+      "type": "function",
+      "role": "legacy_mock_candles",
+      "provider": "replay",
+      "classification": "KILL",
+      "notes": "Legacy mock candle generator for tests/offline tooling; quarantine in legacy/."
+    },
+    {
+      "module": "compare_providers",
+      "object": "get_alpaca_bars",
+      "type": "function",
+      "role": "one-off_script_alpaca_pull",
+      "provider": "alpaca",
+      "classification": "WRAP",
+      "notes": "Utility script that imports alpaca_trade_api directly for ad-hoc comparisons."
+    },
+    {
+      "module": "compare_providers_http",
+      "object": "get_alpaca_daily_bars",
+      "type": "function",
+      "role": "one-off_script_alpaca_http",
+      "provider": "alpaca",
+      "classification": "WRAP",
+      "notes": "HTTP-based utility that calls Alpaca via alpaca_trade_api for ad-hoc tasks."
+    },
+    {
+      "module": "live_candle_visualizer",
+      "object": "module",
+      "type": "script",
+      "role": "visualizer_script",
+      "provider": "alpaca",
+      "classification": "WRAP",
+      "notes": "Standalone script using Alpaca SDK to render live candles; not engine runtime."
+    },
+    {
+      "module": "stockfish_candle_printer",
+      "object": "module",
+      "type": "script",
+      "role": "printer_script",
+      "provider": "alpaca",
+      "classification": "WRAP",
+      "notes": "Ad-hoc script that pulls via Alpaca SDK for display/analysis."
+    },
+    {
+      "module": "alpaca_1min_candle_pull",
+      "object": "module",
+      "type": "script",
+      "role": "data_pull_script",
+      "provider": "alpaca",
+      "classification": "WRAP",
+      "notes": "Utility to pull 1-minute Alpaca candles; ad-hoc tooling."
+    },
+    {
+      "module": "run_live_smoke_test",
+      "object": "module",
+      "type": "script",
+      "role": "smoke_test_runner",
+      "provider": "mixed",
+      "classification": "WRAP",
+      "notes": "Script that composes provider adapters for smoke testing (Polygon/Alpaca/MT5)."
+    },
+    {
+      "module": "live_ingestion_smoke_test",
+      "object": "module",
+      "type": "script",
+      "role": "ingestion_smoke",
+      "provider": "mixed",
+      "classification": "WRAP",
+      "notes": "Local smoke test harness for live ingestion paths."
+    },
+    {
+      "module": "tests_live.test_mt5_adapter_smoke",
+      "object": "module",
+      "type": "script",
+      "role": "integration_test_live_mt5",
+      "provider": "mt5",
+      "classification": "WRAP",
+      "notes": "Integration test that attempts safe mt5 stream interactions; exercises live code paths."
+    },
+    {
+      "module": "tests_live.test_mt5_ticks_and_candles",
+      "object": "module",
+      "type": "script",
+      "role": "integration_test_mt5_ticks",
+      "provider": "mt5",
+      "classification": "WRAP",
+      "notes": "Live test that inspects MT5 tick and candle APIs; pulls data in test context."
+    },
+    {
+      "module": "tests_live.test_polygon_daily",
+      "object": "module",
+      "type": "script",
+      "role": "integration_test_polygon",
+      "provider": "polygon",
+      "classification": "WRAP",
+      "notes": "Live test hitting polygon historical endpoints for validation."
+    },
+    {
+      "module": "tests_live.test_alpaca_intraday",
+      "object": "module",
+      "type": "script",
+      "role": "integration_test_alpaca",
+      "provider": "alpaca",
+      "classification": "WRAP",
+      "notes": "Live test that pulls intraday data from Alpaca for validation."
+    }
+  ],
+  "SUMMARY": {}
+}
