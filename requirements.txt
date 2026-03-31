@@ -1,5 +1,6 @@
 numpy
 pandas
+pyarrow
 scikit-learn
 tqdm
 pyyaml
@@ -9,3 +10,4 @@ ib_insync
 MetaTrader5
 requests
 jsonschema
+python-dotenv

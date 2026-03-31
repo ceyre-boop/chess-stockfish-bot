@@ -1,0 +1,64 @@
+# Execution Configuration for Trading Stockfish
+# Controls paper vs live trading, risk limits, and operational modes
+
+execution:
+  mode: "PAPER"  # Options: PAPER, LIVE
+  
+  # Trading hours (UTC)
+  trading_hours:
+    start: "08:00"
+    end: "22:00"
+    days: ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+  
+  # Risk limits
+  risk:
+    max_daily_loss_usd: 500.0
+    max_concurrent_positions: 3
+    max_position_size_lots: 0.5
+    emergency_stop_loss_pips: 50
+  
+  # Symbol configuration
+  symbols:
+    - "EURUSD"
+    - "GBPUSD" 
+    - "USDJPY"
+    - "XAUUSD"
+    - "US500"
+    - "NAS100"
+  
+  # Timeframes to monitor
+  timeframes:
+    - "M1"
+    - "M5"
+    - "M15"
+    - "H1"
+  
+  # Execution settings
+  execution:
+    slippage_tolerance_pips: 2.0
+    max_spread_pips: 5.0
+    retry_attempts: 3
+    order_timeout_seconds: 30
+  
+  # Logging
+  logging:
+    level: "INFO"
+    save_decisions: true
+    save_audits: true
+    log_dir: "logs"
+
+# Feature toggles
+features:
+  sentiment_analysis: true
+  news_filter: true
+  regime_detection: true
+  participant_tracking: true
+  
+# Data providers (configured via environment variables)
+providers:
+  mt5:
+    enabled: true
+  polygon:
+    enabled: false  # Set to true and configure POLYGON_API_KEY
+  alpaca:
+    enabled: false  # Set to true and configure ALPACA_API_KEY
